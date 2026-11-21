@@ -1113,6 +1113,8 @@ async function generate() {
   const group = [plan.head, ...plan.picks.map((p) => p.face)];
   window.__plan = {
     pool: pool.length,
+    earDists: pool.map((f) => +f.earDist.toFixed(2)),
+    earPick: +plan.picks.find((p) => p.layer === "ears").face.earDist.toFixed(2),
     ms: Math.round(elapsed()),
     head: { key: plan.head.key, yaw: +plan.head.g.yaw.toFixed(3) },
     total: +plan.total.toFixed(2),
