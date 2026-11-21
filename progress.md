@@ -257,6 +257,28 @@ which browsers surface as `TypeError: Failed to fetch` — every click failed wi
 Verified headless with HF requests deliberately aborted: "9 different people
 (0 CelebA + 9 Wikimedia) in 13.8 s", clean hard-cut collage output.
 
+### Update 7: fitted pieces + vector-cut edges (offset hats/ears fixed)
+User asked for flip H/V, rotation, stretch/shear, and scale so donor pieces fit
+the head instead of landing offset (hats, ears), and vector-like cuts rather
+than pixelation. In `docs/main.js`:
+- **Triangle-affine placement**: each slot now maps a donor landmark triangle
+  (e.g. eyes: il, ir, nose; mouth: mouth corners + nose; hair: forehead top +
+  face sides; neck: chin + face sides) exactly onto the head's triangle. This
+  one solve supplies rotation, uniform+non-uniform scale, shear/stretch and
+  translation per feature (no more single anchor + scalar scale).
+- **Flip candidates**: for every slot the placer evaluates no-flip and mirror-X;
+  hair/neck/ears additionally test mirror-Y and mirror-XY. Each candidate is
+  scored by how much of the slot's target shape the donor silhouette fills at a
+  64x64 proxy, minus a distortion penalty (singular-value ratio) and a small
+  flip penalty. The best-fitting orientation is used for the patch, the donor
+  feature clip and the donor silhouette warp (flip applied in the draw transform).
+- **Vector edges**: final pastes now use anti-aliased (0.9 px) mask alpha instead
+  of 0/255 thresholding, so cuts read as smooth scissor/vector edges with no
+  stair-stepping; polygon masks stay hard with sharp corners.
+Verified headless: CelebA path 11.7 s and Wikimedia path 14.2 s, both 9 distinct
+people; screenshots show hair/ears/eyes/nose/mouth fitted to the head outline
+with clean vector edges (debug/web8.png, debug/web9.png).
+
 ## How to run
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt

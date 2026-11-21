@@ -26,6 +26,18 @@ const FEATURES = [
 const FACE_ERASE = new Set(["eyes", "brows", "nose", "mouth", "chin"]);
 const CLIP_GROW = { eyes: 1.35, brows: 1.45, nose: 1.6, chin: 1.5, mouth: 1.5 };
 
+const TRI = {
+  neck: ["chin", "face_l", "face_r"],
+  hair: ["top", "face_l", "face_r"],
+  ears: ["face_l", "face_r", "chin"],
+  eyes: ["il", "ir", "nose"],
+  brows: ["brow_l", "brow_r", "eye_mid"],
+  nose: ["nose", "eye_mid", "mouth_mid"],
+  chin: ["chin", "mouth_l", "mouth_r"],
+  mouth: ["mouth_l", "mouth_r", "nose"],
+};
+const FLIP_Y_SLOTS = new Set(["neck", "hair", "ears"]);
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -130,8 +142,8 @@ function ellipsePath(x, cx, cy, rx, ry, A = null, n = 40) {
     let px = cx + rx * Math.cos(th);
     let py = cy + ry * Math.sin(th);
     if (A) {
-      const qx = A.r * px + A.tx;
-      py = A.r * py + A.ty;
+      const qx = A[0] * px + A[1] * py + A[2];
+      py = A[3] * px + A[4] * py + A[5];
       px = qx;
     }
     if (i === 0) x.moveTo(px, py); else x.lineTo(px, py);
@@ -149,12 +161,26 @@ function smoothMask(c) {
   return threshold(t);
 }
 
-function destIn(c, other) {
+function compIn(c, other) {
   const x = c.getContext("2d", { willReadFrequently: true });
   x.globalCompositeOperation = "destination-in";
   x.drawImage(other, 0, 0);
   x.globalCompositeOperation = "source-over";
+  return c;
+}
+
+function destIn(c, other) {
+  compIn(c, other);
   return threshold(c);
+}
+
+function aa(c) {
+  const t = newCanvas(c.width, c.height);
+  const x = t.getContext("2d", { willReadFrequently: true });
+  x.filter = "blur(0.9px)";
+  x.drawImage(c, 0, 0);
+  x.filter = "none";
+  return t;
 }
 
 function featureMask(layer, g, sil) {
@@ -214,31 +240,151 @@ function clipCanvas(donorGeom, A, layer, subtract) {
   return threshold(c);
 }
 
-function warpAlpha(alphaCanvas, A) {
-  const c = newCanvas();
-  const x = c.getContext("2d", { willReadFrequently: true });
-  x.setTransform(A.r, 0, 0, A.r, A.tx, A.ty);
-  x.drawImage(alphaCanvas, 0, 0);
-  x.setTransform(1, 0, 0, 1, 0, 0);
-  return threshold(c);
+function warpAlpha(alphaCanvas, A, fx, fy) {
+  return threshold(drawWarped(alphaCanvas, A, fx, fy, false));
 }
 
-function patchCanvas(donor, hg, akey, pair) {
-  const gd = geom(donor.tlm);
-  const dm = dist(gd[pair[0]], gd[pair[1]]) || 1;
-  const hm = dist(hg[pair[0]], hg[pair[1]]);
-  const r = clamp(hm / dm, 0.75, 1.3);
-  const A = { r, tx: hg[akey][0] - r * gd[akey][0], ty: hg[akey][1] - r * gd[akey][1] };
+function affineFromTri(q, p) {
+  const q1 = q[0], q2 = q[1], q3 = q[2];
+  const p1 = p[0], p2 = p[1], p3 = p[2];
+  const x1 = q1[0], y1 = q1[1];
+  const x2 = q2[0], y2 = q2[1];
+  const x3 = q3[0], y3 = q3[1];
+  const det = x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2);
+  if (Math.abs(det) < 1e-9) return null;
+  const row = (v1, v2, v3) => [
+    ((y2 - y3) * v1 + (y3 - y1) * v2 + (y1 - y2) * v3) / det,
+    ((x3 - x2) * v1 + (x1 - x3) * v2 + (x2 - x1) * v3) / det,
+    ((x2 * y3 - x3 * y2) * v1 + (x3 * y1 - x1 * y3) * v2 +
+      (x1 * y2 - x2 * y1) * v3) / det,
+  ];
+  const cx = row(p1[0], p2[0], p3[0]);
+  const cy = row(p1[1], p2[1], p3[1]);
+  return [cx[0], cx[1], cx[2], cy[0], cy[1], cy[2]];
+}
+
+function affineScale(A, s) {
+  return [A[0], A[1], A[2] * s, A[3], A[4], A[5] * s];
+}
+
+function distortion(A) {
+  const a = A[0], b = A[1], d = A[3], e = A[4];
+  const e11 = a * a + d * d;
+  const e12 = a * b + d * e;
+  const e22 = b * b + e * e;
+  const tr = e11 + e22;
+  const dt = e11 * e22 - e12 * e12;
+  const disc = Math.max(0, (tr * tr) / 4 - dt);
+  const l1 = tr / 2 + Math.sqrt(disc);
+  const l2 = Math.max(tr / 2 - Math.sqrt(disc), 1e-6);
+  const s1 = Math.sqrt(Math.max(l1, 1e-6));
+  const s2 = Math.sqrt(l2);
+  return { ratio: s1 / s2, scale: Math.sqrt(s1 * s2) };
+}
+
+function drawWarped(imgCanvas, A, fx, fy, fill = true) {
   const c = newCanvas();
   const x = c.getContext("2d");
-  x.fillStyle = `rgb(${BG[0]},${BG[1]},${BG[2]})`;
-  x.fillRect(0, 0, CANVAS, CANVAS);
+  if (fill) {
+    x.fillStyle = `rgb(${BG[0]},${BG[1]},${BG[2]})`;
+    x.fillRect(0, 0, CANVAS, CANVAS);
+  }
   x.imageSmoothingEnabled = true;
   x.imageSmoothingQuality = "high";
-  x.setTransform(r, 0, 0, r, A.tx, A.ty);
-  x.drawImage(donor.warped, 0, 0);
+  x.setTransform(A[0], A[3], A[1], A[4], A[2], A[5]);
+  if (fx) {
+    x.translate(CANVAS, 0);
+    x.scale(-1, 1);
+  }
+  if (fy) {
+    x.translate(0, CANVAS);
+    x.scale(1, -1);
+  }
+  x.drawImage(imgCanvas, 0, 0);
   x.setTransform(1, 0, 0, 1, 0, 0);
-  return { canvas: c, A };
+  return c;
+}
+
+function smallAlpha(face) {
+  if (face.a64) return face.a64;
+  const c = newCanvas(64, 64);
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.imageSmoothingEnabled = true;
+  x.drawImage(face.alpha, 0, 0, 64, 64);
+  face.a64 = c;
+  return c;
+}
+
+function blob64(layer, g) {
+  const c = newCanvas(64, 64);
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.fillStyle = "#fff";
+  for (const s of specs(layer, g)) {
+    x.beginPath();
+    x.ellipse(s.x / 8, s.y / 8, s.rx / 8, s.ry / 8, 0, 0, Math.PI * 2);
+    x.fill();
+  }
+  return x.getImageData(0, 0, 64, 64).data;
+}
+
+function scorePlacement(face, layer, hg, A, fx, fy) {
+  const t = newCanvas(64, 64);
+  const x = t.getContext("2d", { willReadFrequently: true });
+  const A64 = affineScale(A, 1 / 8);
+  x.setTransform(A64[0], A64[3], A64[1], A64[4], A64[2], A64[5]);
+  if (fx) { x.translate(64, 0); x.scale(-1, 1); }
+  if (fy) { x.translate(0, 64); x.scale(1, -1); }
+  x.drawImage(smallAlpha(face), 0, 0);
+  x.setTransform(1, 0, 0, 1, 0, 0);
+  const ad = x.getImageData(0, 0, 64, 64).data;
+  const bd = blob64(layer, hg);
+  let inside = 0, area = 0;
+  for (let i = 0; i < 64 * 64; i++) {
+    const b = bd[i * 4 + 3] > 127;
+    if (!b) continue;
+    area++;
+    if (ad[i * 4 + 3] > 127) inside++;
+  }
+  const cov = area ? inside / area : 0;
+  const d = distortion(A);
+  return cov - 0.03 * Math.max(0, d.ratio - 1) - 0.04 * Math.abs(Math.log(d.scale));
+}
+
+function placeFeature(donor, hg, layer) {
+  const gd = geom(donor.tlm);
+  const P = TRI[layer].map((k) => hg[k]);
+  const Q = TRI[layer].map((k) => gd[k]);
+  const flips = [[false, false], [true, false]];
+  if (FLIP_Y_SLOTS.has(layer)) {
+    flips.push([false, true], [true, true]);
+  }
+  let best = null;
+  for (const [fx, fy] of flips) {
+    const Qf = Q.map(([x, y]) => [fx ? CANVAS - x : x, fy ? CANVAS - y : y]);
+    const A = affineFromTri(Qf, P);
+    if (!A) continue;
+    const s = scorePlacement(donor, layer, hg, A, fx, fy) - 0.015 * ((fx ? 1 : 0) + (fy ? 1 : 0));
+    if (!best || s > best.score) best = { A, fx, fy, score: s };
+  }
+  if (!best) {
+    const s = 1;
+    return {
+      canvas: drawWarped(donor.warped, [s, 0, 0, 0, s, 0], false, false),
+      A: [s, 0, 0, 0, s, 0], fx: false, fy: false, gd, donor,
+    };
+  }
+  const gdF = geom(donor.tlm.map(([x, y]) => [
+    best.fx ? CANVAS - x : x,
+    best.fy ? CANVAS - y : y,
+  ]));
+  return {
+    canvas: drawWarped(donor.warped, best.A, best.fx, best.fy),
+    A: best.A,
+    fx: best.fx,
+    fy: best.fy,
+    gd: gdF,
+    donor,
+  };
 }
 
 function composite(faces) {
@@ -252,27 +398,27 @@ function composite(faces) {
   const sil = head.alpha;
   const hp = newCanvas();
   hp.getContext("2d").drawImage(head.warped, 0, 0);
-  destIn(hp, sil);
+  compIn(hp, aa(sil));
   ox.drawImage(hp, 0, 0);
 
-  FEATURES.forEach(([layer, akey, pair], i) => {
+  FEATURES.forEach(([layer], i) => {
     const donor = faces[i + 1];
-    const { canvas: patch, A } = patchCanvas(donor, hg, akey, pair);
+    const placed = placeFeature(donor, hg, layer);
+    const patch = placed.canvas;
     let m;
     if (layer === "hair") m = regionMask(layer, hg, sil);
     else if (layer === "neck") m = regionMask(layer, hg, null);
     else m = featureMask(layer, hg, sil);
     if (FACE_ERASE.has(layer)) {
-      const gd = geom(donor.tlm);
       const subtract =
         layer === "chin" ? { layer: "mouth", grow: 1.1 }
         : layer === "eyes" ? { layer: "brows", grow: 1.15 }
         : null;
-      m = destIn(m, clipCanvas(gd, A, layer, subtract));
+      m = destIn(m, clipCanvas(placed.gd, placed.A, layer, subtract));
     }
-    m = destIn(m, warpAlpha(donor.alpha, A));
+    m = destIn(m, warpAlpha(donor.alpha, placed.A, placed.fx, placed.fy));
     m = smoothMask(m);
-    destIn(patch, m);
+    compIn(patch, aa(m));
     ox.drawImage(patch, 0, 0);
   });
   return out;
