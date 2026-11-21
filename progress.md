@@ -243,6 +243,20 @@ staircase/fragmented edges (visible in a user zoom). Fix in `docs/main.js`:
 Verified headless: zoomed crop shows a clean continuous hairline cut with no
 fragmentation; full face still composites from 9 distinct people in ~11.5 s.
 
+### Update 6.2: image-source fallback (HF rate limiting broke generation)
+HF `datasets-server` started returning 429 from CloudFront without CORS headers,
+which browsers surface as `TypeError: Failed to fetch` — every click failed with
+"could not collect 9 distinct faces". Fix in `docs/main.js`:
+- primary remains HF rows/cached-assets;
+- on a network-type failure or HTTP 429 the client sets a 60 s HF cooldown and
+  transparently falls back to Wikimedia Commons (`Category:Portrait photographs`,
+  `categorymembers` + `imageinfo` thumbnails at 1024 px, CORS verified). Candidates
+  are shuffled, used once each, and the normal face checks (frontal, eyes, glasses,
+  silhouette coverage) still apply; measured 55% valid faces on a 40-image sample.
+- images keep loading in parallel; per-click deadline raised to 18.5 s.
+Verified headless with HF requests deliberately aborted: "9 different people
+(0 CelebA + 9 Wikimedia) in 13.8 s", clean hard-cut collage output.
+
 ## How to run
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt

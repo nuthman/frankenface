@@ -317,6 +317,62 @@ let segmenter = null;
 const faceCache = new Map();
 const used = new Set();
 const recent = [];
+let hfCooldown = 0;
+let wikiPool = null;
+
+const isNetworkError = (e) =>
+  e instanceof TypeError || /Failed to fetch|Load failed|NetworkError/i.test(String(e && e.message));
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error("http " + r.status);
+  return r.json();
+}
+
+async function wikiBatch(n) {
+  if (!wikiPool || !wikiPool.length) {
+    const j = await getJSON(
+      "https://commons.wikimedia.org/w/api.php?action=query&list=categorymembers" +
+      "&cmtitle=" + encodeURIComponent("Category:Portrait photographs") +
+      "&cmtype=file&cmlimit=500&format=json&origin=*");
+    const arr = ((j.query && j.query.categorymembers) || []).map((m) => m.title);
+    for (let i = arr.length - 1; i > 0; i--) {
+      const k = (Math.random() * (i + 1)) | 0;
+      [arr[i], arr[k]] = [arr[k], arr[i]];
+    }
+    wikiPool = arr;
+  }
+  const titles = wikiPool.splice(0, n);
+  if (!titles.length) return [];
+  const j = await getJSON(
+    "https://commons.wikimedia.org/w/api.php?action=query&titles=" +
+    encodeURIComponent(titles.join("|")) +
+    "&prop=imageinfo&iiprop=url&iiurlwidth=1024&format=json&origin=*");
+  const out = [];
+  for (const p of Object.values(j.query.pages || {})) {
+    const ii = p.imageinfo && p.imageinfo[0];
+    const u = ii && (ii.thumburl || ii.url);
+    if (u) out.push({ key: "wiki:" + p.title, url: u });
+  }
+  return out;
+}
+
+function loadImageTimeout(url, ms) {
+  return new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error("image timeout")), ms);
+    loadImage(url).then(
+      (im) => { clearTimeout(timer); res(im); },
+      (e) => { clearTimeout(timer); rej(e); }
+    );
+  });
+}
+
+function trimCache() {
+  if (faceCache.size > 30) {
+    const first = faceCache.keys().next().value;
+    faceCache.delete(first);
+  }
+}
 
 async function initModels() {
   const fileset = await FilesetResolver.forVisionTasks(
@@ -367,7 +423,7 @@ function loadImage(src) {
   });
 }
 
-async function analyze(img, offset) {
+async function analyze(img, key) {
   const w = img.naturalWidth;
   const h = img.naturalHeight;
   const det = faceLandmarker.detect(img);
@@ -466,7 +522,7 @@ async function analyze(img, offset) {
   if (!total || inside / total < 0.85) throw new Error("silhouette cut the face");
 
   return {
-    offset,
+    key,
     img,
     M2,
     tlm,
@@ -476,22 +532,36 @@ async function analyze(img, offset) {
 }
 
 async function getFace(offset) {
-  if (faceCache.has(offset)) return faceCache.get(offset);
-  const src = await fetchRow(offset);
-  const img = await loadImage(src);
-  const face = await analyze(img, offset);
-  faceCache.set(offset, face);
-  if (faceCache.size > 30) {
-    const first = faceCache.keys().next().value;
-    faceCache.delete(first);
+  const key = "hf:" + offset;
+  if (faceCache.has(key)) return faceCache.get(key);
+  let src;
+  try {
+    src = await fetchRow(offset);
+  } catch (e) {
+    if (isNetworkError(e) || /http 429/.test(String(e.message)))
+      hfCooldown = performance.now() + 60000;
+    throw e;
   }
+  const img = await loadImage(src);
+  const face = await analyze(img, key);
+  faceCache.set(key, face);
+  trimCache();
+  return face;
+}
+
+async function getFaceWiki(cand) {
+  if (faceCache.has(cand.key)) return faceCache.get(cand.key);
+  const img = await loadImageTimeout(cand.url, 12000);
+  const face = await analyze(img, cand.key);
+  faceCache.set(cand.key, face);
+  trimCache();
   return face;
 }
 
 function newOffset() {
   for (let i = 0; i < 200; i++) {
     const o = Math.floor(Math.random() * 15000);
-    if (used.has(o) || recent.includes(o)) continue;
+    if (used.has(o) || recent.includes("hf:" + o)) continue;
     used.add(o);
     return o;
   }
@@ -501,27 +571,60 @@ function newOffset() {
 async function generate() {
   const t0 = performance.now();
   const faces = [];
+  const seen = new Set();
   const failures = [];
-  while (faces.length < 9 && performance.now() - t0 < 18500) {
+  const timeLeft = () => performance.now() - t0 < 18500;
+  const push = (f) => {
+    if (!seen.has(f.key)) {
+      seen.add(f.key);
+      faces.push(f);
+      recent.push(f.key);
+      if (recent.length > 400) recent.shift();
+    }
+  };
+
+  while (faces.length < 9 && timeLeft() && performance.now() >= hfCooldown) {
     const need = 9 - faces.length;
     const offs = [];
     while (offs.length < need) offs.push(newOffset());
     const results = await Promise.allSettled(offs.map((o) => getFace(o)));
+    let netFail = 0;
     for (const r of results) {
-      if (r.status === "fulfilled") faces.push(r.value);
+      if (r.status === "fulfilled") push(r.value);
+      else {
+        failures.push(r.reason && r.reason.message);
+        if (isNetworkError(r.reason)) netFail++;
+      }
+    }
+    if (netFail) {
+      hfCooldown = performance.now() + 60000;
+      break;
+    }
+  }
+
+  while (faces.length < 9 && timeLeft()) {
+    const need = 9 - faces.length;
+    let cands = [];
+    try {
+      cands = await wikiBatch(Math.min(50, Math.max(need * 3, 9)));
+    } catch (e) {
+      failures.push(e && e.message);
+      break;
+    }
+    if (!cands.length) break;
+    const results = await Promise.allSettled(cands.map((c) => getFaceWiki(c)));
+    for (const r of results) {
+      if (r.status === "fulfilled") push(r.value);
       else failures.push(r.reason && r.reason.message);
     }
   }
+
   if (faces.length < 9) {
-    throw new Error("could not collect 9 distinct faces (" + failures.slice(0, 3).join(", ") + ")");
+    throw new Error("could not collect 9 distinct faces (" +
+      failures.slice(0, 3).join(", ") + ")");
   }
   const group = faces.slice(0, 9);
-  for (const f of group) {
-    used.add(f.offset);
-    recent.push(f.offset);
-    if (recent.length > 300) recent.shift();
-  }
-  return { canvas: composite(group), offsets: group.map((f) => f.offset) };
+  return { canvas: composite(group), offsets: group.map((f) => f.key) };
 }
 
 const btn = document.getElementById("gen");
@@ -548,8 +651,11 @@ btn.addEventListener("click", async () => {
     if (currentURL) URL.revokeObjectURL(currentURL);
     currentURL = url;
     const ms = Math.round(performance.now() - t0);
-    setStatus("New face from " + offsets.length + " different people (" +
-      offsets.map((o) => "#" + o).join(" ") + ") in " + ms + " ms. Click Generate again.");
+    const hfCount = offsets.filter((o) => o.startsWith("hf:")).length;
+    const wikiCount = offsets.length - hfCount;
+    const src = hfCount + " CelebA" + (wikiCount ? " + " + wikiCount + " Wikimedia" : "");
+    setStatus("New face from " + offsets.length + " different people (" + src +
+      ") in " + ms + " ms. Click Generate again.");
   } catch (e) {
     console.error(e);
     setStatus("Generation failed: " + (e && e.message ? e.message : e) + " — try again.");
