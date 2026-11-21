@@ -80,7 +80,7 @@ def get_detector():
 def get_session():
     if not hasattr(_tl, "sess"):
         s = requests.Session()
-        s.headers["User-Agent"] = "face-frankenstein/1.0"
+        s.headers["User-Agent"] = "frankenface/1.0"
         _tl.sess = s
     return _tl.sess
 

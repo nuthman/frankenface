@@ -1,4 +1,4 @@
-# Face Frankenstein — progress
+# FrankenFace — progress
 
 ## Requirements
 - Webpage: "Generate" button at top, image display fills the rest of the screen.
@@ -25,6 +25,7 @@
   recovery click 2.4 s, hard cap 15 s (composite itself ~0.05 s).
 
 ## Decisions made
+- **App name**: FrankenFace (renamed from "Face Frankenstein"; the repo/URL stays `face-frankenstein`).
 - **Image source**: `PhilSad/celeba-hq-15k` on Hugging Face via the public
   datasets-server `/rows` endpoint (random offset 0..14999 → 1024×1024 real
   front-facing portrait photos, no API key).
