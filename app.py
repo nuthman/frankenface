@@ -14,11 +14,12 @@ import requests
 import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions
-from flask import Flask, request, send_file, Response
+from flask import Flask, request, send_file, send_from_directory, Response
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(ROOT, "models", "face_landmarker.task")
 CACHE_DIR = os.path.join(ROOT, "cache")
+DOCS_DIR = os.path.join(ROOT, "docs")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 HF_ROWS_URL = "https://datasets-server.huggingface.co/rows"
@@ -555,7 +556,18 @@ def warmup():
 
 @app.route("/")
 def index():
-    return send_file(os.path.join(ROOT, "static", "index.html"))
+    return send_file(os.path.join(DOCS_DIR, "index.html"))
+
+
+@app.route("/main.js")
+def mainjs():
+    return send_file(os.path.join(DOCS_DIR, "main.js"),
+                     mimetype="text/javascript")
+
+
+@app.route("/models/<path:name>")
+def model_file(name):
+    return send_from_directory(os.path.join(DOCS_DIR, "models"), name)
 
 
 @app.route("/generate")
