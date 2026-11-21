@@ -279,6 +279,24 @@ Verified headless: CelebA path 11.7 s and Wikimedia path 14.2 s, both 9 distinct
 people; screenshots show hair/ears/eyes/nose/mouth fitted to the head outline
 with clean vector edges (debug/web8.png, debug/web9.png).
 
+### Update 8: source thumbnails + lightbox, fit reselection, AI-faces tab
+- **Thumbnails**: under the composite, the 9 source faces are shown as labeled
+  62 px thumbnails (head, neck, hair, ears, eyes, brows, nose, chin, mouth),
+  rendered from the warped source face. Clicking one opens a closable lightbox
+  with the original source photo (X button, backdrop click, or Escape closes).
+- **Fit reselection**: after collecting 9 faces, each donor slot is scored with
+  the same affine-fit score; if it is below 0.30 (bad silhouette/angle fit) the
+  client fetches up to 2 replacement candidates for that slot from the active
+  source and keeps the best-scoring one, all inside the 18.5 s click budget.
+- **AI faces tab**: second tab that runs the identical pipeline but pulls all 9
+  images from thispersondoesnotexist.com. TPDNE serves fresh 1024 px JPEGs at
+  `/random-person.jpeg` but without CORS headers, so images are fetched through
+  the free `images.weserv.nl` proxy (CORS *, verified fresh/different per
+  request), giving readable pixels for the browser models.
+Verified headless: web mode (9 Wikimedia fallback, 16.7 s), thumbnails=9,
+lightbox opens the source URL and Escape closes it; AI mode 9 AI faces in 8.9 s
+with thumbnails. Screenshots: ui_real.png, ui_lightbox.png, ui_ai.png.
+
 ## How to run
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt

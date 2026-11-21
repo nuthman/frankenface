@@ -370,7 +370,7 @@ function placeFeature(donor, hg, layer) {
     const s = 1;
     return {
       canvas: drawWarped(donor.warped, [s, 0, 0, 0, s, 0], false, false),
-      A: [s, 0, 0, 0, s, 0], fx: false, fy: false, gd, donor,
+      A: [s, 0, 0, 0, s, 0], fx: false, fy: false, gd, donor, score: -1,
     };
   }
   const gdF = geom(donor.tlm.map(([x, y]) => [
@@ -384,6 +384,7 @@ function placeFeature(donor, hg, layer) {
     fy: best.fy,
     gd: gdF,
     donor,
+    score: best.score,
   };
 }
 
@@ -569,7 +570,7 @@ function loadImage(src) {
   });
 }
 
-async function analyze(img, key) {
+async function analyze(img, key, src) {
   const w = img.naturalWidth;
   const h = img.naturalHeight;
   const det = faceLandmarker.detect(img);
@@ -669,6 +670,7 @@ async function analyze(img, key) {
 
   return {
     key,
+    src,
     img,
     M2,
     tlm,
@@ -689,7 +691,7 @@ async function getFace(offset) {
     throw e;
   }
   const img = await loadImage(src);
-  const face = await analyze(img, key);
+  const face = await analyze(img, key, src);
   faceCache.set(key, face);
   trimCache();
   return face;
@@ -698,7 +700,7 @@ async function getFace(offset) {
 async function getFaceWiki(cand) {
   if (faceCache.has(cand.key)) return faceCache.get(cand.key);
   const img = await loadImageTimeout(cand.url, 12000);
-  const face = await analyze(img, cand.key);
+  const face = await analyze(img, cand.key, cand.url);
   faceCache.set(cand.key, face);
   trimCache();
   return face;
@@ -714,11 +716,59 @@ function newOffset() {
   return Math.floor(Math.random() * 15000);
 }
 
+let mode = "real";
+let aiCounter = 0;
+
+async function getFaceAI() {
+  const key = "ai:" + (++aiCounter) + ":" + Math.random().toString(36).slice(2);
+  const src = "https://images.weserv.nl/?url=" +
+    encodeURIComponent("thispersondoesnotexist.com/random-person.jpeg?cb=" +
+      Math.random().toString(36).slice(2) + Date.now()) +
+    "&w=1024&h=1024&fit=cover&output=jpg";
+  const img = await loadImageTimeout(src, 16000);
+  const face = await analyze(img, key, src);
+  faceCache.set(key, face);
+  trimCache();
+  return face;
+}
+
+async function fetchBatch(need) {
+  const out = [];
+  if (mode === "ai") {
+    const res = await Promise.allSettled(
+      Array.from({ length: need }, () => getFaceAI()));
+    for (const r of res) if (r.status === "fulfilled") out.push(r.value);
+    return out;
+  }
+  if (performance.now() >= hfCooldown) {
+    const offs = [];
+    while (offs.length < need) offs.push(newOffset());
+    const res = await Promise.allSettled(offs.map((o) => getFace(o)));
+    let netFail = 0;
+    for (const r of res) {
+      if (r.status === "fulfilled") out.push(r.value);
+      else if (isNetworkError(r.reason)) netFail++;
+    }
+    if (netFail) { hfCooldown = performance.now() + 60000; }
+  }
+  const stillNeed = need - out.length;
+  if (stillNeed > 0) {
+    try {
+      const cands = await wikiBatch(Math.min(50, Math.max(stillNeed * 3, 9)));
+      const res = await Promise.allSettled(cands.map((c) => getFaceWiki(c)));
+      for (const r of res) if (r.status === "fulfilled") out.push(r.value);
+    } catch (e) { /* wiki unavailable */ }
+  }
+  return out;
+}
+
+const MIN_FIT = 0.3;
+const MAX_FIT_TRIES = 2;
+
 async function generate() {
   const t0 = performance.now();
   const faces = [];
   const seen = new Set();
-  const failures = [];
   const timeLeft = () => performance.now() - t0 < 18500;
   const push = (f) => {
     if (!seen.has(f.key)) {
@@ -729,48 +779,37 @@ async function generate() {
     }
   };
 
-  while (faces.length < 9 && timeLeft() && performance.now() >= hfCooldown) {
-    const need = 9 - faces.length;
-    const offs = [];
-    while (offs.length < need) offs.push(newOffset());
-    const results = await Promise.allSettled(offs.map((o) => getFace(o)));
-    let netFail = 0;
-    for (const r of results) {
-      if (r.status === "fulfilled") push(r.value);
-      else {
-        failures.push(r.reason && r.reason.message);
-        if (isNetworkError(r.reason)) netFail++;
+  while (faces.length < 9 && timeLeft()) {
+    const batch = await fetchBatch(9 - faces.length);
+    if (!batch.length) break;
+    batch.forEach(push);
+  }
+  if (faces.length < 9) throw new Error("could not collect 9 distinct faces");
+
+  const hg = geom(faces[0].tlm);
+  for (let i = 1; i < 9 && timeLeft(); i++) {
+    const layer = FEATURES[i - 1][0];
+    let cur = placeFeature(faces[i], hg, layer);
+    if ((cur.score ?? -1) >= MIN_FIT) continue;
+    let bestFace = faces[i];
+    let bestScore = cur.score ?? -1;
+    for (let t = 0; t < MAX_FIT_TRIES && timeLeft(); t++) {
+      const batch = await fetchBatch(1);
+      if (!batch.length) break;
+      const f = batch[0];
+      if (seen.has(f.key)) continue;
+      seen.add(f.key);
+      const p = placeFeature(f, hg, layer);
+      if ((p.score ?? -1) > bestScore) {
+        bestScore = p.score ?? -1;
+        bestFace = f;
       }
     }
-    if (netFail) {
-      hfCooldown = performance.now() + 60000;
-      break;
-    }
+    faces[i] = bestFace;
   }
 
-  while (faces.length < 9 && timeLeft()) {
-    const need = 9 - faces.length;
-    let cands = [];
-    try {
-      cands = await wikiBatch(Math.min(50, Math.max(need * 3, 9)));
-    } catch (e) {
-      failures.push(e && e.message);
-      break;
-    }
-    if (!cands.length) break;
-    const results = await Promise.allSettled(cands.map((c) => getFaceWiki(c)));
-    for (const r of results) {
-      if (r.status === "fulfilled") push(r.value);
-      else failures.push(r.reason && r.reason.message);
-    }
-  }
-
-  if (faces.length < 9) {
-    throw new Error("could not collect 9 distinct faces (" +
-      failures.slice(0, 3).join(", ") + ")");
-  }
   const group = faces.slice(0, 9);
-  return { canvas: composite(group), offsets: group.map((f) => f.key) };
+  return { canvas: composite(group), group };
 }
 
 const btn = document.getElementById("gen");
@@ -783,25 +822,87 @@ function setStatus(html) {
   status.innerHTML = html;
 }
 
+const thumbsEl = document.getElementById("thumbs");
+const lightbox = document.getElementById("lightbox");
+const lightboxImg = document.getElementById("lightbox-img");
+const lightboxClose = document.getElementById("lightbox-close");
+const tabButtons = Array.from(document.querySelectorAll(".tab"));
+const SLOT_NAMES = ["head", ...FEATURES.map((f) => f[0])];
+
+function renderThumbs(group) {
+  thumbsEl.innerHTML = "";
+  group.forEach((face, i) => {
+    const d = document.createElement("div");
+    d.className = "thumb";
+    d.title = SLOT_NAMES[i] + " — " + (face.key.startsWith("ai:")
+      ? "AI generated" : "source photo");
+    const c = document.createElement("canvas");
+    c.width = 96;
+    c.height = 96;
+    c.getContext("2d").drawImage(face.warped, 0, 0, 96, 96);
+    const label = document.createElement("span");
+    label.textContent = SLOT_NAMES[i];
+    d.appendChild(c);
+    d.appendChild(label);
+    d.addEventListener("click", () => openLightbox(face.src));
+    thumbsEl.appendChild(d);
+  });
+}
+
+function openLightbox(src) {
+  if (!src) return;
+  lightboxImg.src = src;
+  lightbox.classList.add("open");
+}
+
+function closeLightbox() {
+  lightbox.classList.remove("open");
+  lightboxImg.removeAttribute("src");
+}
+
+lightbox.addEventListener("click", (e) => {
+  if (e.target === lightbox || e.target === lightboxClose) closeLightbox();
+});
+lightboxClose.addEventListener("click", closeLightbox);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeLightbox();
+});
+tabButtons.forEach((b) => b.addEventListener("click", () => {
+  if (busy) return;
+  mode = b.dataset.mode;
+  tabButtons.forEach((x) => x.classList.toggle("active", x === b));
+  setStatus(mode === "ai"
+    ? "AI faces mode: 9 fresh images from thispersondoesnotexist.com."
+    : "Web mode: random portraits from CelebA-HQ / Wikimedia Commons.");
+}));
+
 btn.addEventListener("click", async () => {
   if (busy || !faceLandmarker) return;
   busy = true;
   btn.disabled = true;
-  setStatus('<span class="spinner"></span> Searching for 9 random people and cutting their features…');
+  setStatus('<span class="spinner"></span> ' + (mode === "ai"
+    ? "Generating 9 AI faces and cutting their features…"
+    : "Searching for 9 random people and cutting their features…"));
   const t0 = performance.now();
   try {
-    const { canvas, offsets } = await generate();
+    const { canvas, group } = await generate();
     const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", 0.9));
     const url = URL.createObjectURL(blob);
     imgEl.src = url;
     if (currentURL) URL.revokeObjectURL(currentURL);
     currentURL = url;
+    renderThumbs(group);
     const ms = Math.round(performance.now() - t0);
-    const hfCount = offsets.filter((o) => o.startsWith("hf:")).length;
-    const wikiCount = offsets.length - hfCount;
-    const src = hfCount + " CelebA" + (wikiCount ? " + " + wikiCount + " Wikimedia" : "");
-    setStatus("New face from " + offsets.length + " different people (" + src +
-      ") in " + ms + " ms. Click Generate again.");
+    const aiCount = group.filter((f) => f.key.startsWith("ai:")).length;
+    const hfCount = group.filter((f) => f.key.startsWith("hf:")).length;
+    const wikiCount = group.length - hfCount - aiCount;
+    const parts = [];
+    if (aiCount) parts.push(aiCount + " AI");
+    if (hfCount) parts.push(hfCount + " CelebA");
+    if (wikiCount) parts.push(wikiCount + " Wikimedia");
+    setStatus("New face from " + group.length + " different " +
+      (aiCount === group.length ? "AI-generated people" : "people") +
+      " (" + parts.join(" + ") + ") in " + ms + " ms. Click thumbnails to inspect, or Generate again.");
   } catch (e) {
     console.error(e);
     setStatus("Generation failed: " + (e && e.message ? e.message : e) + " — try again.");

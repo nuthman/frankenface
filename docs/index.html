@@ -14,22 +14,30 @@
   }
   header {
     display: flex; align-items: center; gap: 14px;
-    padding: 18px 24px;
+    padding: 14px 24px;
     border-bottom: 1px solid #23262e;
+    flex-wrap: wrap;
   }
-  h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: .02em; }
-  button {
+  h1 { font-size: 17px; font-weight: 600; margin: 0 8px 0 0; letter-spacing: .02em; }
+  #tabs { display: flex; gap: 6px; margin-right: auto; }
+  .tab {
+    font: inherit; font-size: 13px; font-weight: 600;
+    padding: 8px 14px; border-radius: 8px; cursor: pointer;
+    background: #1b1e25; color: #9aa3b5; border: 1px solid #2a2e37;
+  }
+  .tab.active { background: #26324d; color: #dfe7ff; border-color: #3d5a99; }
+  button#gen {
     font: inherit; font-weight: 700; font-size: 16px;
     padding: 12px 26px; border-radius: 10px;
     border: 0; cursor: pointer;
     background: #3d6bff; color: #fff;
   }
-  button:hover:not([disabled]) { background: #4f7bff; }
-  button:active:not([disabled]) { transform: translateY(1px); }
+  button#gen:hover:not([disabled]) { background: #4f7bff; }
+  button#gen:active:not([disabled]) { transform: translateY(1px); }
   button[disabled] { opacity: .45; cursor: default; }
   #stage {
-    flex: 1; display: flex; align-items: center; justify-content: center;
-    position: relative; min-height: 0; padding: 16px;
+    flex: 1; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 12px; min-height: 0; padding: 16px;
   }
   #out {
     max-width: 100%; max-height: 100%;
@@ -37,6 +45,26 @@
     border-radius: 14px;
     box-shadow: 0 8px 30px rgba(0,0,0,.5);
     background: #20232a;
+    min-height: 0;
+  }
+  #thumbs {
+    display: flex; gap: 10px; flex-wrap: wrap; justify-content: center;
+    min-height: 0;
+  }
+  .thumb {
+    position: relative; cursor: pointer; line-height: 0;
+    border-radius: 8px; overflow: hidden;
+    border: 1px solid #2a2e37;
+    background: #171a20;
+  }
+  .thumb:hover { border-color: #4f7bff; }
+  .thumb canvas { width: 62px; height: 62px; display: block; }
+  .thumb span {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 2px 4px; font-size: 9px; line-height: 1.2;
+    color: #e8eaf0; background: rgba(10,12,16,.72);
+    text-align: center; letter-spacing: .03em;
+    text-transform: uppercase;
   }
   #status {
     padding: 0 24px 16px; font-size: 13px; color: #8b93a5;
@@ -49,15 +77,43 @@
     animation: spin 0.8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  #lightbox {
+    position: fixed; inset: 0; z-index: 20; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(8,10,14,.88); padding: 28px;
+  }
+  #lightbox.open { display: flex; }
+  #lightbox img {
+    max-width: 100%; max-height: 100%;
+    border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,.6);
+  }
+  #lightbox-close {
+    position: fixed; top: 14px; right: 18px;
+    font: inherit; font-size: 26px; line-height: 1;
+    width: 42px; height: 42px; border-radius: 50%;
+    background: rgba(30,34,42,.85); color: #fff;
+    border: 1px solid #3a4050; cursor: pointer;
+  }
 </style>
 </head>
 <body>
   <header>
     <h1>Face Frankenstein</h1>
+    <nav id="tabs">
+      <button class="tab active" data-mode="real">CelebA + Wikimedia</button>
+      <button class="tab" data-mode="ai">AI faces</button>
+    </nav>
     <button id="gen" disabled>Generate</button>
   </header>
-  <div id="stage"><img id="out" alt="Generated face"></div>
+  <div id="stage">
+    <img id="out" alt="Generated face">
+    <div id="thumbs"></div>
+  </div>
   <div id="status">Loading models…</div>
+  <div id="lightbox">
+    <img id="lightbox-img" alt="">
+    <button id="lightbox-close" aria-label="Close">×</button>
+  </div>
   <script type="module" src="./main.js"></script>
 </body>
 </html>
