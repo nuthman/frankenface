@@ -446,11 +446,30 @@ async function analyze(img, offset) {
   threshold(alpha);
   smoothMask(alpha);
 
+  const tlm = applyM(lm, M2);
+  const g = geom(tlm);
+  const fw = dist(g.face_r, g.face_l);
+  const ad = alpha.getContext("2d", { willReadFrequently: true })
+    .getImageData(0, 0, CANVAS, CANVAS).data;
+  let inside = 0, total = 0;
+  const x0 = Math.round(g.face_mid[0] - 0.45 * fw);
+  const x1 = Math.round(g.face_mid[0] + 0.45 * fw);
+  const y0 = Math.round(g.eye_mid[1] - 0.3 * g.ed);
+  const y1 = Math.round(g.chin[1]);
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const on = ad[(y * CANVAS + x) * 4 + 3] > 127;
+      total++;
+      if (on) inside++;
+    }
+  }
+  if (!total || inside / total < 0.85) throw new Error("silhouette cut the face");
+
   return {
     offset,
     img,
     M2,
-    tlm: applyM(lm, M2),
+    tlm,
     warped,
     alpha,
   };

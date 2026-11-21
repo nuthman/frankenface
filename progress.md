@@ -236,7 +236,10 @@ staircase/fragmented edges (visible in a user zoom). Fix in `docs/main.js`:
 - smooth the category mask at native 256 res with two blur+threshold passes
   (4 px then 2 px) before scaling up (bilinear, high quality) and warping;
 - a final `smoothMask` (blur 1.4 px + threshold) on every completed patch mask
-  removes 1-px specks/islands while keeping a hard edge.
+  removes 1-px specks/islands while keeping a hard edge;
+- new face-coverage check: if the person mask covers less than 85% of the face
+  centre box the face is rejected (`silhouette cut the face`) and another random
+  person is fetched, preventing half-face results from bad segmentations.
 Verified headless: zoomed crop shows a clean continuous hairline cut with no
 fragmentation; full face still composites from 9 distinct people in ~11.5 s.
 
