@@ -297,6 +297,59 @@ Verified headless: web mode (9 Wikimedia fallback, 16.7 s), thumbnails=9,
 lightbox opens the source URL and Escape closes it; AI mode 9 AI faces in 8.9 s
 with thumbnails. Screenshots: ui_real.png, ui_lightbox.png, ui_ai.png.
 
+### Update 9: "too extreme" rework - sane fitting, real flips, no double features
+User feedback: composites were a mess - features skewed hard, a second (skewed) pair
+of eyes overlapping the head's own eyes, and a mouth that should simply have been
+mirrored to match the head's direction instead of being sheared. Root causes found
+and fixed in `docs/main.js`:
+- **Flips never worked.** The mirrored candidate mapped landmarks by *label*, so its net
+  transform was identical to the unmirrored one and the flip penalty always won.
+  Now `mirrorGeom()` builds the mirrored donor with left/right labels swapped, so a flip
+  is a genuinely different placement. Flip choice is driven by head direction
+  (`yaw` = nose offset from the face-edge midpoint; mirrored donor has `-yaw`).
+- **Skew removed.** The exact 3-point affine (free shear/anisotropic scale) is replaced
+  by a similarity transform only: one pivot landmark is aligned exactly, scale and
+  rotation come from one landmark pair, both clamped (scale 0.8-1.3, rotation <= 5-8
+  degrees depending on slot). No shear, no non-uniform stretch.
+- **Wrong eyebrow landmarks.** The left-brow anchor (landmark 23) is on the lower
+  eyelid, so the "brows" patch cut out an eye region - a big part of the "second pair of
+  eyes". Brows now use the average of the real upper/lower brow rows (105/66/52/65 and
+  334/296/282/295).
+- **Head's own features erased.** Every replaced feature region on the head is filled
+  with a smooth skin-colour fill (stacked blurs of the surrounding skin) before the
+  donor patch is pasted, using the very same hard-edged blob shapes, so nothing of the
+  original eyes/nose/mouth/brows/chin can show through.
+- **Donor assignment instead of random slots.** A pool of ~11 faces is fetched; for each
+  (face, slot) the best flip is costed (coverage of the target shape by the donor
+  silhouette + proportion residual + scale + rotation + head-direction mismatch) and the
+  Hungarian algorithm assigns 8 distinct donors to the 8 slots. The head is chosen among
+  near-frontal faces (|yaw| <= 0.22) by lowest total cost. Faces with |yaw| > 0.5 are
+  rejected outright. This replaces the old per-slot reselection (MIN_FIT).
+- **Duplicate people fixed.** thispersondoesnotexist.com returns the *same* image to
+  near-simultaneous requests (9 concurrent requests -> 2 distinct images; even 0.6 s
+  spacing gave occasional repeats), which put one person into several slots. Each image
+  now gets a 16x16 luminance signature and exact/near duplicates are dropped; AI
+  requests are staggered 320 ms apart and topped up until 11 unique valid faces exist.
+- **Head = face oval only.** The head layer is clipped to the MediaPipe face oval (x1.04).
+  Hair, ears, and neck/shoulders come exclusively from their own donors: hair = brow line
+  upward plus the band outside the oval down to the jaw corners; neck = below the jaw
+  corners outside the oval, drawn *behind* the chin so the jaw overlaps it (no more flat
+  rectangle across the chin); ears = tall ear-shaped cut-outs outside the face edge,
+  chosen for visible ear skin (colour at the ear position vs cheek skin) rather than hair.
+- Mouth cut-out now subtracts the donor's nose, hair cut-out subtracts donor brows, so
+  extra features do not travel with a piece.
+- AI tab: the "StyleGAN2 (Karras et al.)" caption stamped on every TPDNE image is
+  cropped off (bottom 32 rows) before analysis.
+- Pipeline warm-up on page load (landmarker + segmenter + a full dummy composite on a
+  bundled synthetic face, `docs/models/warmup.jpg`): first click dropped from ~14.7 s to
+  ~6 s.
+Verified headless (local :8931 and live Pages): 12/12 generations succeeded with 9/9
+distinct faces each; 3.5-6.3 s per click (budget 20 s). In the logged runs the raw
+scale ratios were 0.86-1.14 and rotations under 5 degrees (applied values are clamped
+anyway), and mirrored donors were used wherever the donor faced the other way. Contact sheets: debug/sheet_real.png, debug/sheet_ai.png, debug/sheet_ai_wm.png.
+The local Flask app now serves the very same `docs/` build at http://127.0.0.1:8931/
+(the old Python pipeline is kept at `/generate` but is no longer used by the page).
+
 ## How to run
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt

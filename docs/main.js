@@ -11,32 +11,44 @@ const EX = 256;
 const BG = [28, 30, 32];
 const L_IRIS = [EX - ED / 2, EYE_Y];
 const R_IRIS = [EX + ED / 2, EYE_Y];
+const RAD = Math.PI / 180;
+const MAX_YAW = 0.5;   // strongly turned heads are rejected outright
+const HEAD_YAW = 0.22; // the base head must be close to frontal
 
-const FEATURES = [
-  ["neck", "chin", ["face_l", "face_r"]],
-  ["hair", "top", ["face_l", "face_r"]],
-  ["ears", "face_mid", ["face_l", "face_r"]],
-  ["eyes", "eye_mid", ["il", "ir"]],
-  ["brows", "brow_mid", ["brow_l", "brow_r"]],
-  ["nose", "nose", ["nose", "eye_mid"]],
-  ["chin", "chin", ["chin", "mouth_mid"]],
-  ["mouth", "mouth_mid", ["mouth_l", "mouth_r"]],
-];
+// Paste order: back to front.
+const SLOTS = ["neck", "hair", "ears", "eyes", "brows", "nose", "chin", "mouth"];
 
+// Slots whose base-head counterpart is erased (smooth skin fill) before the donor is pasted.
 const FACE_ERASE = new Set(["eyes", "brows", "nose", "mouth", "chin"]);
-const CLIP_GROW = { eyes: 1.35, brows: 1.45, nose: 1.6, chin: 1.5, mouth: 1.5 };
 
-const TRI = {
-  neck: ["chin", "face_l", "face_r"],
-  hair: ["top", "face_l", "face_r"],
-  ears: ["face_l", "face_r", "chin"],
-  eyes: ["il", "ir", "nose"],
-  brows: ["brow_l", "brow_r", "eye_mid"],
-  nose: ["nose", "eye_mid", "mouth_mid"],
-  chin: ["chin", "mouth_l", "mouth_r"],
-  mouth: ["mouth_l", "mouth_r", "nose"],
+// MediaPipe face-oval loop: the "head" layer is only this oval (skin, cheeks, jaw line);
+// everything outside it - hair, ears, neck and shoulders - comes from the other donors.
+const OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378,
+  400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
+const CLIP_GROW = { ears: 1.4, eyes: 1.35, brows: 1.45, nose: 1.6, chin: 1.5, mouth: 1.5 };
+const MASK_GROW = { ears: 1.15, eyes: 1.2, brows: 1.2, nose: 1.15, chin: 1.1, mouth: 1.08 };
+// Parts of the donor that must not travel along with the cut-out.
+const SUBTRACT = {
+  eyes: { layer: "brows", grow: 1.15 },
+  chin: { layer: "mouth", grow: 1.1 },
+  mouth: { layer: "nose", grow: 1.0 },
+  hair: { layer: "brows", grow: 1.3 },
 };
-const FLIP_Y_SLOTS = new Set(["neck", "hair", "ears"]);
+
+// Placement = similarity transform only (uniform scale + small rotation + translation).
+// pivot: landmark aligned exactly; axis: landmark pair giving scale and rotation;
+// chk: landmarks whose residual measures how well the proportions agree;
+// s / r: allowed scale range and max rotation (degrees); wy: weight of the head-direction mismatch.
+const FIT = {
+  eyes:  { pivot: "eye_mid",   axis: ["il", "ir"],           chk: [],                   s: [0.92, 1.1],  r: 5, wy: 2.0 },
+  brows: { pivot: "brow_mid",  axis: ["brow_l", "brow_r"],   chk: ["eye_mid"],          s: [0.85, 1.2],  r: 8, wy: 1.0 },
+  nose:  { pivot: "nose",      axis: ["eye_mid", "nose"],    chk: ["mouth_mid"],        s: [0.85, 1.2],  r: 8, wy: 3.0 },
+  chin:  { pivot: "chin",      axis: ["mouth_mid", "chin"],  chk: ["jaw_l", "jaw_r"],   s: [0.85, 1.2],  r: 8, wy: 1.5 },
+  mouth: { pivot: "mouth_mid", axis: ["mouth_l", "mouth_r"], chk: ["nose", "chin"],     s: [0.85, 1.25], r: 8, wy: 2.5 },
+  hair:  { pivot: "top",       axis: ["face_l", "face_r"],   chk: ["eye_mid"],          s: [0.85, 1.25], r: 6, wy: 0.8 },
+  neck:  { pivot: "chin",      axis: ["face_l", "face_r"],   chk: ["jaw_l", "jaw_r"],   s: [0.8, 1.3],   r: 6, wy: 1.0 },
+  ears:  { pivot: "face_mid",  axis: ["face_l", "face_r"],   chk: ["eye_mid", "chin"],  s: [0.85, 1.2],  r: 6, wy: 1.0 },
+};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
@@ -47,6 +59,12 @@ function newCanvas(w = CANVAS, h = CANVAS) {
   c.width = w;
   c.height = h;
   return c;
+}
+
+function cloneCanvas(c) {
+  const t = newCanvas(c.width, c.height);
+  t.getContext("2d").drawImage(c, 0, 0);
+  return t;
 }
 
 function applyM(pts, m) {
@@ -68,17 +86,51 @@ function threshold(c) {
   return c;
 }
 
+// ---------------------------------------------------------------- geometry
+
+const avg = (...ps) => [
+  ps.reduce((s, p) => s + p[0], 0) / ps.length,
+  ps.reduce((s, p) => s + p[1], 0) / ps.length,
+];
+const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+
 function geom(tlm) {
-  const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-  return {
+  const g = {
     il: tlm[468], ir: tlm[473], eye_mid: mid(tlm[468], tlm[473]),
     ed: dist(tlm[468], tlm[473]),
     nose: tlm[1], mouth_l: tlm[61], mouth_r: tlm[291],
     mouth_mid: mid(tlm[61], tlm[291]), chin: tlm[152],
-    brow_l: tlm[23], brow_r: tlm[300], brow_mid: mid(tlm[23], tlm[300]),
+    // centres of the two eyebrows (average of the upper and lower mesh rows)
+    brow_l: avg(tlm[105], tlm[66], tlm[52], tlm[65]),
+    brow_r: avg(tlm[334], tlm[296], tlm[282], tlm[295]),
     face_l: tlm[234], face_r: tlm[454], face_mid: mid(tlm[234], tlm[454]),
-    top: tlm[10],
+    top: tlm[10], jaw_l: tlm[172], jaw_r: tlm[397],
   };
+  g.brow_mid = mid(g.brow_l, g.brow_r);
+  g.fw = dist(g.face_r, g.face_l);
+  // signed head direction: >0 nose points towards the viewer's right
+  g.yaw = (2 * g.nose[0] - g.face_l[0] - g.face_r[0]) / g.fw;
+  return g;
+}
+
+// Geometry of the horizontally mirrored face. Left/right labels are swapped so that
+// "mouth_l" is again the corner on the viewer's left - this is what makes a mirrored
+// donor genuinely different from the unmirrored one.
+function mirrorGeom(g) {
+  const M = (p) => [CANVAS - p[0], p[1]];
+  const m = {
+    il: M(g.ir), ir: M(g.il), nose: M(g.nose),
+    mouth_l: M(g.mouth_r), mouth_r: M(g.mouth_l), chin: M(g.chin),
+    brow_l: M(g.brow_r), brow_r: M(g.brow_l),
+    face_l: M(g.face_r), face_r: M(g.face_l), top: M(g.top),
+    jaw_l: M(g.jaw_r), jaw_r: M(g.jaw_l), ed: g.ed, fw: g.fw,
+  };
+  m.eye_mid = mid(m.il, m.ir);
+  m.mouth_mid = mid(m.mouth_l, m.mouth_r);
+  m.brow_mid = mid(m.brow_l, m.brow_r);
+  m.face_mid = mid(m.face_l, m.face_r);
+  m.yaw = -g.yaw;
+  return m;
 }
 
 function specs(layer, g, grow = 1) {
@@ -89,18 +141,19 @@ function specs(layer, g, grow = 1) {
     case "neck":
       return [P(g.face_mid[0], g.chin[1] + 1.4 * ed, 0.95 * fw, 1.45 * ed)];
     case "ears": {
-      const ey = g.eye_mid[1] + 0.15 * ed;
-      const side = 0.55 * fw;
-      return [P(g.face_mid[0] - side, ey, 0.14 * fw, 0.3 * ed),
-              P(g.face_mid[0] + side, ey, 0.14 * fw, 0.3 * ed)];
+      // ear-shaped (tall) ellipses centred just outside the face edge
+      const ey = g.eye_mid[1] + 0.25 * ed;
+      const side = 0.5 * fw + 0.12 * ed;
+      return [P(g.face_mid[0] - side, ey, 0.2 * ed, 0.45 * ed),
+              P(g.face_mid[0] + side, ey, 0.2 * ed, 0.45 * ed)];
     }
     case "eyes":
       return [P(g.il[0], g.il[1] + 0.02 * ed, 0.3 * ed, 0.2 * ed),
               P(g.ir[0], g.ir[1] + 0.02 * ed, 0.3 * ed, 0.2 * ed)];
     case "brows": {
       const sp = dist(g.brow_r, g.brow_l);
-      return [P(g.brow_l[0], g.brow_l[1], 0.36 * sp, 0.13 * ed),
-              P(g.brow_r[0], g.brow_r[1], 0.36 * sp, 0.13 * ed)];
+      return [P(g.brow_l[0], g.brow_l[1], 0.4 * sp, 0.13 * ed),
+              P(g.brow_r[0], g.brow_r[1], 0.4 * sp, 0.13 * ed)];
     }
     case "nose": {
       const nl = dist(g.nose, g.eye_mid);
@@ -121,6 +174,8 @@ function specs(layer, g, grow = 1) {
       return [];
   }
 }
+
+// ---------------------------------------------------------------- masks
 
 function blobPath(x, cx, cy, rx, ry, n = 18) {
   x.beginPath();
@@ -174,6 +229,14 @@ function destIn(c, other) {
   return threshold(c);
 }
 
+function destOut(c, other) {
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.globalCompositeOperation = "destination-out";
+  x.drawImage(other, 0, 0);
+  x.globalCompositeOperation = "source-over";
+  return threshold(c);
+}
+
 function aa(c) {
   const t = newCanvas(c.width, c.height);
   const x = t.getContext("2d", { willReadFrequently: true });
@@ -183,106 +246,99 @@ function aa(c) {
   return t;
 }
 
-function featureMask(layer, g, sil) {
+function featureMask(layer, g, sil, grow = 1) {
   const c = newCanvas();
   const x = c.getContext("2d", { willReadFrequently: true });
   x.fillStyle = "#fff";
-  for (const s of specs(layer, g)) blobPath(x, s.x, s.y, s.rx, s.ry);
+  for (const s of specs(layer, g, grow)) blobPath(x, s.x, s.y, s.rx, s.ry);
   threshold(c);
   if (sil) destIn(c, sil);
   return threshold(c);
 }
 
-function regionMask(layer, g, sil) {
+// Face oval as a point list (optionally scaled about its centre).
+function ovalPoints(tlm, scale = 1) {
+  const pts = OVAL.map((i) => tlm[i]);
+  const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+  const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+  return pts.map(([x, y]) => [cx + scale * (x - cx), cy + scale * (y - cy)]);
+}
+
+function pointInPoly(pts, x, y) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const [xi, yi] = pts[i];
+    const [xj, yj] = pts[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+// Smooth closed curve through the polygon (midpoint quadratic splines).
+function polyPath(x, pts) {
+  const n = pts.length;
+  const m = (i) => [(pts[i][0] + pts[(i + 1) % n][0]) / 2, (pts[i][1] + pts[(i + 1) % n][1]) / 2];
+  const s = m(n - 1);
+  x.beginPath();
+  x.moveTo(s[0], s[1]);
+  for (let i = 0; i < n; i++) {
+    const e = m(i);
+    x.quadraticCurveTo(pts[i][0], pts[i][1], e[0], e[1]);
+  }
+  x.closePath();
+}
+
+function polyCanvas(pts) {
   const c = newCanvas();
   const x = c.getContext("2d", { willReadFrequently: true });
   x.fillStyle = "#fff";
-  if (layer === "hair") {
-    const y = g.eye_mid[1] - 0.32 * g.ed;
-    x.fillRect(0, 0, CANVAS, Math.max(0, y));
-  } else {
-    const top = g.chin[1] - 0.25 * g.ed;
-    const fw = dist(g.face_r, g.face_l);
-    const cx = g.face_mid[0];
-    x.beginPath();
-    x.moveTo(cx - 0.55 * fw, top);
-    x.lineTo(cx + 0.55 * fw, top);
-    x.lineTo(cx + 0.95 * fw, CANVAS);
-    x.lineTo(cx - 0.95 * fw, CANVAS);
-    x.closePath();
-    x.fill();
-  }
-  threshold(c);
-  if (sil) destIn(c, sil);
+  polyPath(x, pts);
+  x.fill();
   return threshold(c);
 }
 
-function clipCanvas(donorGeom, A, layer, subtract) {
+// Hair = everything above the brow line (forehead + hair volume) plus, beside the face,
+// the band outside the face oval down to the jaw corners (the neck region takes over there).
+function hairRegion(g, ovalC) {
   const c = newCanvas();
   const x = c.getContext("2d", { willReadFrequently: true });
   x.fillStyle = "#fff";
-  for (const s of specs(layer, donorGeom, CLIP_GROW[layer]))
-    ellipsePath(x, s.x, s.y, s.rx, s.ry, A);
-  threshold(c);
-  if (subtract) {
-    const sub = newCanvas();
-    const sx = sub.getContext("2d");
-    sx.fillStyle = "#fff";
-    for (const s of specs(subtract.layer, donorGeom, subtract.grow))
-      ellipsePath(sx, s.x, s.y, s.rx, s.ry, A);
-    threshold(sub);
-    const x2 = c.getContext("2d", { willReadFrequently: true });
-    x2.globalCompositeOperation = "destination-out";
-    x2.drawImage(sub, 0, 0);
-    x2.globalCompositeOperation = "source-over";
-    threshold(c);
-  }
+  const cut = Math.max(0, g.eye_mid[1] - 0.32 * g.ed);
+  const low = Math.min(g.jaw_l[1], g.jaw_r[1]) + 0.05 * g.ed;
+  x.fillRect(0, 0, CANVAS, cut);
+  const band = newCanvas();
+  const bx = band.getContext("2d", { willReadFrequently: true });
+  bx.fillStyle = "#fff";
+  bx.fillRect(0, cut, CANVAS, Math.max(0, low - cut));
+  destOut(band, ovalC);
+  x.drawImage(band, 0, 0);
   return threshold(c);
 }
 
-function warpAlpha(alphaCanvas, A, fx, fy) {
-  return threshold(drawWarped(alphaCanvas, A, fx, fy, false));
+// Neck and shoulders = everything below the jaw corners that is outside the face oval.
+function neckRegion(g, ovalC) {
+  const c = newCanvas();
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.fillStyle = "#fff";
+  const y0 = Math.min(g.jaw_l[1], g.jaw_r[1]);
+  x.fillRect(0, y0, CANVAS, CANVAS - y0);
+  return destOut(c, ovalC);
 }
 
-function affineFromTri(q, p) {
-  const q1 = q[0], q2 = q[1], q3 = q[2];
-  const p1 = p[0], p2 = p[1], p3 = p[2];
-  const x1 = q1[0], y1 = q1[1];
-  const x2 = q2[0], y2 = q2[1];
-  const x3 = q3[0], y3 = q3[1];
-  const det = x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2);
-  if (Math.abs(det) < 1e-9) return null;
-  const row = (v1, v2, v3) => [
-    ((y2 - y3) * v1 + (y3 - y1) * v2 + (y1 - y2) * v3) / det,
-    ((x3 - x2) * v1 + (x1 - x3) * v2 + (x2 - x1) * v3) / det,
-    ((x2 * y3 - x3 * y2) * v1 + (x3 * y1 - x1 * y3) * v2 +
-      (x1 * y2 - x2 * y1) * v3) / det,
-  ];
-  const cx = row(p1[0], p2[0], p3[0]);
-  const cy = row(p1[1], p2[1], p3[1]);
-  return [cx[0], cx[1], cx[2], cy[0], cy[1], cy[2]];
+// Donor-side ellipses, transformed into head coordinates by A.
+function ellipseMask(g, A, layer, grow) {
+  const c = newCanvas();
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.fillStyle = "#fff";
+  for (const s of specs(layer, g, grow)) ellipsePath(x, s.x, s.y, s.rx, s.ry, A);
+  return threshold(c);
 }
 
-function affineScale(A, s) {
-  return [A[0], A[1], A[2] * s, A[3], A[4], A[5] * s];
+function warpAlpha(alphaCanvas, A, fx) {
+  return threshold(drawWarped(alphaCanvas, A, fx, false));
 }
 
-function distortion(A) {
-  const a = A[0], b = A[1], d = A[3], e = A[4];
-  const e11 = a * a + d * d;
-  const e12 = a * b + d * e;
-  const e22 = b * b + e * e;
-  const tr = e11 + e22;
-  const dt = e11 * e22 - e12 * e12;
-  const disc = Math.max(0, (tr * tr) / 4 - dt);
-  const l1 = tr / 2 + Math.sqrt(disc);
-  const l2 = Math.max(tr / 2 - Math.sqrt(disc), 1e-6);
-  const s1 = Math.sqrt(Math.max(l1, 1e-6));
-  const s2 = Math.sqrt(l2);
-  return { ratio: s1 / s2, scale: Math.sqrt(s1 * s2) };
-}
-
-function drawWarped(imgCanvas, A, fx, fy, fill = true) {
+function drawWarped(imgCanvas, A, fx, fill = true) {
   const c = newCanvas();
   const x = c.getContext("2d");
   if (fill) {
@@ -296,132 +352,284 @@ function drawWarped(imgCanvas, A, fx, fy, fill = true) {
     x.translate(CANVAS, 0);
     x.scale(-1, 1);
   }
-  if (fy) {
-    x.translate(0, CANVAS);
-    x.scale(1, -1);
-  }
   x.drawImage(imgCanvas, 0, 0);
   x.setTransform(1, 0, 0, 1, 0, 0);
   return c;
 }
 
-function smallAlpha(face) {
-  if (face.a64) return face.a64;
-  const c = newCanvas(64, 64);
-  const x = c.getContext("2d", { willReadFrequently: true });
-  x.imageSmoothingEnabled = true;
-  x.drawImage(face.alpha, 0, 0, 64, 64);
-  face.a64 = c;
-  return c;
+// Replace the head's own features by a smooth fill sampled from the surrounding skin,
+// so that nothing of the original eyes/nose/mouth can show through a donor patch.
+function eraseFill(hp, er, hg) {
+  const known = newCanvas();
+  const kx = known.getContext("2d", { willReadFrequently: true });
+  kx.drawImage(hp, 0, 0);
+  kx.globalCompositeOperation = "destination-out";
+  kx.drawImage(er, 0, 0);
+  kx.globalCompositeOperation = "source-over";
+
+  const x0 = Math.max(0, Math.round(hg.face_mid[0] - 0.4 * hg.fw));
+  const x1 = Math.min(CANVAS, Math.round(hg.face_mid[0] + 0.4 * hg.fw));
+  const y0 = Math.max(0, Math.round(hg.eye_mid[1] - 0.1 * hg.ed));
+  const y1 = Math.min(CANVAS, Math.round(hg.chin[1] - 0.2 * hg.ed));
+  let flat = "rgb(205,165,145)";
+  if (x1 > x0 && y1 > y0) {
+    const d = kx.getImageData(x0, y0, x1 - x0, y1 - y0).data;
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] > 200) { r += d[i]; g += d[i + 1]; b += d[i + 2]; n++; }
+    }
+    if (n) flat = `rgb(${(r / n) | 0},${(g / n) | 0},${(b / n) | 0})`;
+  }
+
+  const fill = newCanvas();
+  const fx = fill.getContext("2d");
+  fx.fillStyle = flat;
+  fx.fillRect(0, 0, CANVAS, CANVAS);
+  for (const rad of [64, 32, 16, 8, 4]) {
+    fx.filter = `blur(${rad}px)`;
+    fx.drawImage(known, 0, 0);
+  }
+  fx.filter = "none";
+  fx.drawImage(known, 0, 0);
+  compIn(fill, er);
+  hp.getContext("2d").drawImage(fill, 0, 0);
 }
 
-function blob64(layer, g) {
-  const c = newCanvas(64, 64);
-  const x = c.getContext("2d", { willReadFrequently: true });
-  x.fillStyle = "#fff";
-  for (const s of specs(layer, g)) {
-    x.beginPath();
-    x.ellipse(s.x / 8, s.y / 8, s.rx / 8, s.ry / 8, 0, 0, Math.PI * 2);
-    x.fill();
+// ---------------------------------------------------------------- fitting
+
+const RING = (() => {
+  const p = [[0, 0]];
+  for (let i = 0; i < 8; i++) {
+    const t = (i * Math.PI) / 4;
+    p.push([0.5 * Math.cos(t), 0.5 * Math.sin(t)]);
+    p.push([0.9 * Math.cos(t), 0.9 * Math.sin(t)]);
   }
-  return x.getImageData(0, 0, 64, 64).data;
+  return p;
+})();
+
+function inAlpha(face, x, y) {
+  const ix = Math.floor(x / 8);
+  const iy = Math.floor(y / 8);
+  return ix >= 0 && ix < 64 && iy >= 0 && iy < 64 && face.a64[iy * 64 + ix] === 1;
 }
 
-function scorePlacement(face, layer, hg, A, fx, fy) {
-  const t = newCanvas(64, 64);
-  const x = t.getContext("2d", { willReadFrequently: true });
-  const A64 = affineScale(A, 1 / 8);
-  x.setTransform(A64[0], A64[3], A64[1], A64[4], A64[2], A64[5]);
-  if (fx) { x.translate(64, 0); x.scale(-1, 1); }
-  if (fy) { x.translate(0, 64); x.scale(1, -1); }
-  x.drawImage(smallAlpha(face), 0, 0);
-  x.setTransform(1, 0, 0, 1, 0, 0);
-  const ad = x.getImageData(0, 0, 64, 64).data;
-  const bd = blob64(layer, hg);
-  let inside = 0, area = 0;
-  for (let i = 0; i < 64 * 64; i++) {
-    const b = bd[i * 4 + 3] > 127;
-    if (!b) continue;
-    area++;
-    if (ad[i * 4 + 3] > 127) inside++;
+// Sample points of the head-side region that the donor has to cover.
+function slotPoints(layer, hg, head) {
+  const oval = head.oval || (head.oval = ovalPoints(head.tlm, 1));
+  const pts = [];
+  if (layer === "hair") {
+    // the hair volume right above the forehead
+    const cut = hg.eye_mid[1] - 0.32 * hg.ed;
+    const y0 = hg.top[1] - 0.3 * hg.ed;
+    for (let j = 0; j < 4; j++) {
+      for (let i = 0; i < 7; i++) {
+        pts.push([hg.face_mid[0] + (i / 6 - 0.5) * 0.8 * hg.fw, y0 + (j / 3) * (cut - y0)]);
+      }
+    }
+  } else if (layer === "neck") {
+    // the neck / shoulder column just below the chin
+    const y0 = hg.chin[1] + 0.1 * hg.ed;
+    for (let j = 0; j < 4; j++) {
+      for (let i = 0; i < 7; i++) {
+        pts.push([hg.face_mid[0] + (i / 6 - 0.5) * 0.7 * hg.fw, y0 + (j / 3) * 0.5 * hg.ed]);
+      }
+    }
+  } else {
+    for (const s of specs(layer, hg)) {
+      for (const [u, v] of RING) {
+        const x = s.x + u * s.rx;
+        const y = s.y + v * s.ry;
+        // ears are only pasted outside the face oval
+        if (layer === "ears" && pointInPoly(oval, x, y)) continue;
+        pts.push([x, y]);
+      }
+    }
   }
-  const cov = area ? inside / area : 0;
-  const d = distortion(A);
-  return cov - 0.03 * Math.max(0, d.ratio - 1) - 0.04 * Math.abs(Math.log(d.scale));
+  return pts;
 }
 
-function placeFeature(donor, hg, layer) {
-  const gd = geom(donor.tlm);
-  const P = TRI[layer].map((k) => hg[k]);
-  const Q = TRI[layer].map((k) => gd[k]);
-  const flips = [[false, false], [true, false]];
-  if (FLIP_Y_SLOTS.has(layer)) {
-    flips.push([false, true], [true, true]);
+// Fraction of the head-side sample points that land on the donor's silhouette.
+function coverage(face, A, flip, pts) {
+  if (!pts.length) return 1;
+  const det = A[0] * A[4] - A[1] * A[3];
+  if (Math.abs(det) < 1e-9) return 0;
+  const ia = A[4] / det, ib = -A[1] / det, id = -A[3] / det, ie = A[0] / det;
+  let n = 0;
+  for (const [X, Y] of pts) {
+    const dx = X - A[2], dy = Y - A[5];
+    let x = ia * dx + ib * dy;
+    const y = id * dx + ie * dy;
+    if (flip) x = CANVAS - x;
+    if (inAlpha(face, x, y)) n++;
   }
+  return n / pts.length;
+}
+
+function fitSlot(layer, hg, face, flip, pts) {
+  const F = FIT[layer];
+  const gd = flip ? face.gm : face.g;
+  const vb = [hg[F.axis[1]][0] - hg[F.axis[0]][0], hg[F.axis[1]][1] - hg[F.axis[0]][1]];
+  const vd = [gd[F.axis[1]][0] - gd[F.axis[0]][0], gd[F.axis[1]][1] - gd[F.axis[0]][1]];
+  const nb = Math.hypot(vb[0], vb[1]);
+  const nd = Math.hypot(vd[0], vd[1]);
+  if (nb < 1e-6 || nd < 1e-6) return null;
+  const sRaw = nb / nd;
+  let thRaw = Math.atan2(vb[1], vb[0]) - Math.atan2(vd[1], vd[0]);
+  thRaw = Math.atan2(Math.sin(thRaw), Math.cos(thRaw));
+  const s = clamp(sRaw, F.s[0], F.s[1]);
+  const th = clamp(thRaw, -F.r * RAD, F.r * RAD);
+  const c = Math.cos(th) * s;
+  const sn = Math.sin(th) * s;
+  const pb = hg[F.pivot];
+  const qd = gd[F.pivot];
+  const A = [c, -sn, pb[0] - (c * qd[0] - sn * qd[1]),
+             sn, c, pb[1] - (sn * qd[0] + c * qd[1])];
+  let chk = 0;
+  for (const k of F.chk) {
+    const q = gd[k];
+    const x = A[0] * q[0] + A[1] * q[1] + A[2];
+    const y = A[3] * q[0] + A[4] * q[1] + A[5];
+    chk += Math.hypot(x - hg[k][0], y - hg[k][1]);
+  }
+  chk = F.chk.length ? chk / (F.chk.length * hg.ed) : 0;
+  const cov = coverage(face, A, flip, pts);
+  const yawd = Math.abs(gd.yaw - hg.yaw);
+  let cost = 2.5 * (1 - cov) + 3.0 * chk + 1.8 * Math.abs(Math.log(sRaw))
+    + 0.8 * (Math.abs(thRaw) / (10 * RAD)) + F.wy * yawd + (flip ? 0.03 : 0);
+  // ears: prefer donors whose ears are actually visible skin rather than hidden under hair
+  if (layer === "ears") cost += 4.0 * face.earDist;
+  return { A, flip, cost, cov, chk, sRaw, thRaw, s, th, yawd };
+}
+
+function bestFit(layer, hg, face, pts) {
   let best = null;
-  for (const [fx, fy] of flips) {
-    const Qf = Q.map(([x, y]) => [fx ? CANVAS - x : x, fy ? CANVAS - y : y]);
-    const A = affineFromTri(Qf, P);
-    if (!A) continue;
-    const s = scorePlacement(donor, layer, hg, A, fx, fy) - 0.015 * ((fx ? 1 : 0) + (fy ? 1 : 0));
-    if (!best || s > best.score) best = { A, fx, fy, score: s };
+  for (const flip of [false, true]) {
+    const f = fitSlot(layer, hg, face, flip, pts);
+    if (f && (!best || f.cost < best.cost)) best = f;
   }
-  if (!best) {
-    const s = 1;
-    return {
-      canvas: drawWarped(donor.warped, [s, 0, 0, 0, s, 0], false, false),
-      A: [s, 0, 0, 0, s, 0], fx: false, fy: false, gd, donor, score: -1,
-    };
-  }
-  const gdF = geom(donor.tlm.map(([x, y]) => [
-    best.fx ? CANVAS - x : x,
-    best.fy ? CANVAS - y : y,
-  ]));
-  return {
-    canvas: drawWarped(donor.warped, best.A, best.fx, best.fy),
-    A: best.A,
-    fx: best.fx,
-    fy: best.fy,
-    gd: gdF,
-    donor,
-    score: best.score,
-  };
+  return best || { A: [1, 0, 0, 0, 1, 0], flip: false, cost: 9, cov: 0, chk: 0,
+                   sRaw: 1, thRaw: 0, s: 1, th: 0, yawd: 0 };
 }
 
-function composite(faces) {
+// Optimal one-to-one assignment (Kuhn-Munkres), rows <= columns.
+function hungarian(a) {
+  const n = a.length, m = a[0].length;
+  const INF = 1e9;
+  const u = new Array(n + 1).fill(0), v = new Array(m + 1).fill(0);
+  const p = new Array(m + 1).fill(0), way = new Array(m + 1).fill(0);
+  for (let i = 1; i <= n; i++) {
+    p[0] = i;
+    let j0 = 0;
+    const minv = new Array(m + 1).fill(INF);
+    const used = new Array(m + 1).fill(false);
+    do {
+      used[j0] = true;
+      const i0 = p[j0];
+      let delta = INF, j1 = 0;
+      for (let j = 1; j <= m; j++) {
+        if (used[j]) continue;
+        const cur = a[i0 - 1][j - 1] - u[i0] - v[j];
+        if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+        if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+      }
+      for (let j = 0; j <= m; j++) {
+        if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
+        else minv[j] -= delta;
+      }
+      j0 = j1;
+    } while (p[j0] !== 0);
+    do { const j1 = way[j0]; p[j0] = p[j1]; j0 = j1; } while (j0);
+  }
+  const ans = new Array(n).fill(-1);
+  for (let j = 1; j <= m; j++) if (p[j]) ans[p[j] - 1] = j - 1;
+  return ans;
+}
+
+function assign(head, others) {
+  const hg = head.g;
+  const pts = {};
+  for (const s of SLOTS) pts[s] = slotPoints(s, hg, head);
+  const fits = SLOTS.map((s) => others.map((f) => bestFit(s, hg, f, pts[s])));
+  const cost = fits.map((row) => row.map((x) => x.cost + Math.random() * 0.04));
+  const cols = hungarian(cost);
+  const picks = cols.map((j, i) => ({ layer: SLOTS[i], face: others[j], fit: fits[i][j] }));
+  const total = picks.reduce((t, p) => t + p.fit.cost, 0);
+  return { head, picks, total };
+}
+
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const k = (Math.random() * (i + 1)) | 0;
+    [a[i], a[k]] = [a[k], a[i]];
+  }
+  return a;
+}
+
+// Choose the head and give every slot a different donor, minimising the total misfit.
+function planCollage(pool) {
+  let heads = pool.filter((f) => Math.abs(f.g.yaw) <= HEAD_YAW);
+  if (heads.length < 2) {
+    heads = pool.slice().sort((a, b) => Math.abs(a.g.yaw) - Math.abs(b.g.yaw)).slice(0, 2);
+  }
+  const cands = shuffle(heads.slice()).slice(0, 4);
+  let best = null;
+  for (const head of cands) {
+    const plan = assign(head, pool.filter((f) => f !== head));
+    if (!best || plan.total < best.total) best = plan;
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------- composite
+
+function composite(plan) {
   const out = newCanvas();
   const ox = out.getContext("2d");
   ox.fillStyle = `rgb(${BG[0]},${BG[1]},${BG[2]})`;
   ox.fillRect(0, 0, CANVAS, CANVAS);
 
-  const head = faces[0];
-  const hg = geom(head.tlm);
+  const head = plan.head;
+  const hg = head.g;
   const sil = head.alpha;
+  const pick = {};
+  for (const p of plan.picks) pick[p.layer] = p;
+
+  // The head is only its face oval; hair, ears, neck and shoulders belong to other donors.
+  const ovalC = polyCanvas(ovalPoints(head.tlm, 1));
+  const headClip = polyCanvas(ovalPoints(head.tlm, 1.04));
   const hp = newCanvas();
   hp.getContext("2d").drawImage(head.warped, 0, 0);
-  compIn(hp, aa(sil));
-  ox.drawImage(hp, 0, 0);
+  compIn(hp, aa(destIn(cloneCanvas(sil), headClip)));
 
-  FEATURES.forEach(([layer], i) => {
-    const donor = faces[i + 1];
-    const placed = placeFeature(donor, hg, layer);
-    const patch = placed.canvas;
-    let m;
-    if (layer === "hair") m = regionMask(layer, hg, sil);
-    else if (layer === "neck") m = regionMask(layer, hg, null);
-    else m = featureMask(layer, hg, sil);
-    if (FACE_ERASE.has(layer)) {
-      const subtract =
-        layer === "chin" ? { layer: "mouth", grow: 1.1 }
-        : layer === "eyes" ? { layer: "brows", grow: 1.15 }
-        : null;
-      m = destIn(m, clipCanvas(placed.gd, placed.A, layer, subtract));
-    }
-    m = destIn(m, warpAlpha(donor.alpha, placed.A, placed.fx, placed.fy));
+  // Hard-edged cut regions on the head; the very same shapes are erased and re-filled.
+  const masks = {};
+  for (const layer of FACE_ERASE) masks[layer] = featureMask(layer, hg, sil, MASK_GROW[layer]);
+  const er = newCanvas();
+  const ex = er.getContext("2d");
+  for (const layer of FACE_ERASE) ex.drawImage(masks[layer], 0, 0);
+  eraseFill(hp, er, hg);
+
+  // Cut a donor's pixels through mask m and paste them with a clean vector-like edge.
+  const paste = (layer, m) => {
+    const { face: donor, fit } = pick[layer];
+    const gd = fit.flip ? donor.gm : donor.g;
+    if (CLIP_GROW[layer]) m = destIn(m, ellipseMask(gd, fit.A, layer, CLIP_GROW[layer]));
+    const sub = SUBTRACT[layer];
+    if (sub) m = destOut(m, ellipseMask(gd, fit.A, sub.layer, sub.grow));
+    m = destIn(m, warpAlpha(donor.alpha, fit.A, fit.flip));
     m = smoothMask(m);
+    const patch = drawWarped(donor.warped, fit.A, fit.flip);
     compIn(patch, aa(m));
     ox.drawImage(patch, 0, 0);
-  });
+  };
+
+  paste("neck", neckRegion(hg, ovalC));        // behind the chin
+  ox.drawImage(hp, 0, 0);                      // the face oval
+  paste("hair", hairRegion(hg, ovalC));
+  paste("ears", destOut(featureMask("ears", hg, null, MASK_GROW.ears), ovalC));
+  for (const layer of ["eyes", "brows", "nose", "chin", "mouth"]) {
+    paste(layer, cloneCanvas(masks[layer]));
+  }
   return out;
 }
 
@@ -443,6 +651,36 @@ function warpMatrix(lm) {
   ];
 }
 
+function boxMean(d, W, x0, y0, x1, y1) {
+  x0 = Math.max(0, Math.round(x0)); y0 = Math.max(0, Math.round(y0));
+  x1 = Math.min(W, Math.round(x1)); y1 = Math.min(512, Math.round(y1));
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const i = (y * W + x) * 4;
+      r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
+    }
+  }
+  return n ? [r / n, g / n, b / n] : [0, 0, 0];
+}
+
+// How far the colour at the ear positions is from the cheek skin (0 = clearly visible ears).
+function earSkinDistance(wd, g) {
+  const cheekY0 = g.il[1] + 0.4 * ED;
+  const cheekY1 = g.il[1] + 0.65 * ED;
+  const sl = boxMean(wd, CANVAS, g.il[0] - 0.2 * ED, cheekY0, g.il[0] + 0.1 * ED, cheekY1);
+  const sr = boxMean(wd, CANVAS, g.ir[0] - 0.1 * ED, cheekY0, g.ir[0] + 0.2 * ED, cheekY1);
+  const skin = [(sl[0] + sr[0]) / 2, (sl[1] + sr[1]) / 2, (sl[2] + sr[2]) / 2];
+  const ey = g.eye_mid[1] + 0.25 * ED;
+  const side = 0.5 * g.fw + 0.12 * ED;
+  const el = boxMean(wd, CANVAS, g.face_mid[0] - side - 0.1 * ED, ey - 0.2 * ED,
+                     g.face_mid[0] - side + 0.1 * ED, ey + 0.2 * ED);
+  const er = boxMean(wd, CANVAS, g.face_mid[0] + side - 0.1 * ED, ey - 0.2 * ED,
+                     g.face_mid[0] + side + 0.1 * ED, ey + 0.2 * ED);
+  const d3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) / 255;
+  return (d3(el, skin) + d3(er, skin)) / 2;
+}
+
 function boxStats(d, W, x0, y0, x1, y1) {
   x0 = Math.max(0, Math.round(x0)); y0 = Math.max(0, Math.round(y0));
   x1 = Math.min(W, Math.round(x1)); y1 = Math.min(512, Math.round(y1));
@@ -458,6 +696,8 @@ function boxStats(d, W, x0, y0, x1, y1) {
   const mean = sum / n;
   return { mean, std: Math.sqrt(Math.max(0, sum2 / n - mean * mean)) };
 }
+
+// ---------------------------------------------------------------- sources
 
 let faceLandmarker = null;
 let segmenter = null;
@@ -483,10 +723,7 @@ async function wikiBatch(n) {
       "&cmtitle=" + encodeURIComponent("Category:Portrait photographs") +
       "&cmtype=file&cmlimit=500&format=json&origin=*");
     const arr = ((j.query && j.query.categorymembers) || []).map((m) => m.title);
-    for (let i = arr.length - 1; i > 0; i--) {
-      const k = (Math.random() * (i + 1)) | 0;
-      [arr[i], arr[k]] = [arr[k], arr[i]];
-    }
+    shuffle(arr);
     wikiPool = arr;
   }
   const titles = wikiPool.splice(0, n);
@@ -521,6 +758,18 @@ function trimCache() {
   }
 }
 
+// First inference / first canvas filter are slow (graph + shader compilation), so run the
+// complete pipeline once on a small synthetic face before the first click.
+async function warmUp() {
+  try {
+    const im = await loadImage("./models/warmup.jpg");
+    const f = await analyze(im, "warmup", im.src);
+    composite(planCollage(Array.from({ length: 9 }, () => ({ ...f }))));
+  } catch (e) {
+    console.warn("warm-up skipped:", e && e.message ? e.message : e);
+  }
+}
+
 async function initModels() {
   const fileset = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.3/wasm"
@@ -540,6 +789,7 @@ async function initModels() {
         outputCategoryMask: true,
         outputConfidenceMasks: false,
       });
+      await warmUp();
       return delegate;
     } catch (e) {
       console.warn("delegate", delegate, "failed:", e);
@@ -570,14 +820,56 @@ function loadImage(src) {
   });
 }
 
+// Tiny luminance signature: catches the same picture being delivered twice
+// (thispersondoesnotexist.com hands identical images to near-simultaneous requests).
+const genSigs = [];
+
+function imgSig(img) {
+  const c = newCanvas(16, 16);
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.drawImage(img, 0, 0, 16, 16);
+  const d = x.getImageData(0, 0, 16, 16).data;
+  const s = new Float32Array(256);
+  for (let i = 0; i < 256; i++) {
+    s[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  }
+  return s;
+}
+
+function registerImage(img) {
+  const s = imgSig(img);
+  const dup = genSigs.some((o) => {
+    let t = 0;
+    for (let i = 0; i < 256; i++) t += Math.abs(o[i] - s[i]);
+    return t / 256 < 5;
+  });
+  if (dup) throw new Error("duplicate image");
+  genSigs.push(s);
+}
+
+function alphaGrid(alpha) {
+  const c = newCanvas(64, 64);
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.imageSmoothingEnabled = true;
+  x.drawImage(alpha, 0, 0, 64, 64);
+  const d = x.getImageData(0, 0, 64, 64).data;
+  const out = new Uint8Array(4096);
+  for (let i = 0; i < 4096; i++) out[i] = d[i * 4 + 3] > 127 ? 1 : 0;
+  return out;
+}
+
 async function analyze(img, key, src) {
-  const w = img.naturalWidth;
-  const h = img.naturalHeight;
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
   const det = faceLandmarker.detect(img);
   if (!det.faceLandmarks || !det.faceLandmarks.length) throw new Error("no face");
   const lm = det.faceLandmarks[0].map((p) => [p.x * w, p.y * h]);
   const M2 = warpMatrix(lm);
   if (!M2) throw new Error("turned/too small");
+
+  const tlm = applyM(lm, M2);
+  const g = geom(tlm);
+  if (Math.abs(g.yaw) > MAX_YAW) throw new Error("not front facing");
 
   const warped = newCanvas();
   const wx = warped.getContext("2d", { willReadFrequently: true });
@@ -649,14 +941,11 @@ async function analyze(img, key, src) {
   threshold(alpha);
   smoothMask(alpha);
 
-  const tlm = applyM(lm, M2);
-  const g = geom(tlm);
-  const fw = dist(g.face_r, g.face_l);
   const ad = alpha.getContext("2d", { willReadFrequently: true })
     .getImageData(0, 0, CANVAS, CANVAS).data;
   let inside = 0, total = 0;
-  const x0 = Math.round(g.face_mid[0] - 0.45 * fw);
-  const x1 = Math.round(g.face_mid[0] + 0.45 * fw);
+  const x0 = Math.round(g.face_mid[0] - 0.45 * g.fw);
+  const x1 = Math.round(g.face_mid[0] + 0.45 * g.fw);
   const y0 = Math.round(g.eye_mid[1] - 0.3 * g.ed);
   const y1 = Math.round(g.chin[1]);
   for (let y = y0; y < y1; y++) {
@@ -674,12 +963,16 @@ async function analyze(img, key, src) {
     img,
     M2,
     tlm,
+    g,
+    gm: mirrorGeom(g),
     warped,
     alpha,
+    a64: alphaGrid(alpha),
+    earDist: earSkinDistance(wd, g),
   };
 }
 
-async function getFace(offset) {
+async function getFace(offset, stop) {
   const key = "hf:" + offset;
   if (faceCache.has(key)) return faceCache.get(key);
   let src;
@@ -691,15 +984,19 @@ async function getFace(offset) {
     throw e;
   }
   const img = await loadImage(src);
+  registerImage(img);
+  if (stop && stop()) throw new Error("enough");
   const face = await analyze(img, key, src);
   faceCache.set(key, face);
   trimCache();
   return face;
 }
 
-async function getFaceWiki(cand) {
+async function getFaceWiki(cand, stop) {
   if (faceCache.has(cand.key)) return faceCache.get(cand.key);
   const img = await loadImageTimeout(cand.url, 12000);
+  registerImage(img);
+  if (stop && stop()) throw new Error("enough");
   const face = await analyze(img, cand.key, cand.url);
   faceCache.set(cand.key, face);
   trimCache();
@@ -719,98 +1016,117 @@ function newOffset() {
 let mode = "real";
 let aiCounter = 0;
 
-async function getFaceAI() {
+async function getFaceAI(stop) {
   const key = "ai:" + (++aiCounter) + ":" + Math.random().toString(36).slice(2);
   const src = "https://images.weserv.nl/?url=" +
     encodeURIComponent("thispersondoesnotexist.com/random-person.jpeg?cb=" +
       Math.random().toString(36).slice(2) + Date.now()) +
     "&w=1024&h=1024&fit=cover&output=jpg";
   const img = await loadImageTimeout(src, 16000);
-  const face = await analyze(img, key, src);
+  registerImage(img);
+  if (stop && stop()) throw new Error("enough");
+  // thispersondoesnotexist.com stamps "StyleGAN2 (Karras et al.)" into the bottom rows
+  const c = newCanvas(img.naturalWidth, img.naturalHeight - 32);
+  c.getContext("2d").drawImage(img, 0, 0);
+  const face = await analyze(c, key, src);
   faceCache.set(key, face);
   trimCache();
   return face;
 }
 
-async function fetchBatch(need) {
-  const out = [];
-  if (mode === "ai") {
-    const res = await Promise.allSettled(
-      Array.from({ length: need }, () => getFaceAI()));
-    for (const r of res) if (r.status === "fulfilled") out.push(r.value);
-    return out;
-  }
+async function waitFor(tasks, enough) {
+  let done = false;
+  const all = Promise.allSettled(tasks).then(() => { done = true; });
+  while (!done && !enough()) await Promise.race([all, sleep(50)]);
+}
+
+const POOL_TARGET = 11; // faces to choose from (9 are used)
+const SOFT_MS = 10500;  // after this a pool of 9 is good enough
+const HARD_MS = 18500;  // overall click budget
+const AI_GAP = 320;     // spacing of AI requests (see registerImage)
+
+async function fetchReal(need, add, enough) {
+  let got = 0;
+  const take = (f) => { add(f); got++; };
   if (performance.now() >= hfCooldown) {
     const offs = [];
     while (offs.length < need) offs.push(newOffset());
-    const res = await Promise.allSettled(offs.map((o) => getFace(o)));
     let netFail = 0;
-    for (const r of res) {
-      if (r.status === "fulfilled") out.push(r.value);
-      else if (isNetworkError(r.reason)) netFail++;
-    }
-    if (netFail) { hfCooldown = performance.now() + 60000; }
+    const tasks = offs.map((o, i) =>
+      sleep(i * 60).then(() => getFace(o, enough)).then(take, (e) => {
+        if (isNetworkError(e)) netFail++;
+      }));
+    await waitFor(tasks, enough);
+    if (netFail) hfCooldown = performance.now() + 60000;
   }
-  const stillNeed = need - out.length;
-  if (stillNeed > 0) {
+  if (!enough()) {
     try {
-      const cands = await wikiBatch(Math.min(50, Math.max(stillNeed * 3, 9)));
-      const res = await Promise.allSettled(cands.map((c) => getFaceWiki(c)));
-      for (const r of res) if (r.status === "fulfilled") out.push(r.value);
+      const want = Math.max(1, need - got);
+      const cands = await wikiBatch(Math.min(40, Math.max(Math.ceil(want * 2.5), 8)));
+      const tasks = cands.map((c) => getFaceWiki(c, enough).then(take, () => {}));
+      await waitFor(tasks, enough);
     } catch (e) { /* wiki unavailable */ }
   }
-  return out;
 }
 
-const MIN_FIT = 0.3;
-const MAX_FIT_TRIES = 2;
+async function collectReal(pool, add, elapsed) {
+  const enough = () => pool.length >= POOL_TARGET || (pool.length >= 9 && elapsed() > SOFT_MS);
+  for (let round = 0; pool.length < 9 && elapsed() < HARD_MS && round < 6; round++) {
+    await fetchReal(Math.max(POOL_TARGET - pool.length, 9 - pool.length) + 1, add, enough);
+  }
+}
+
+async function collectAI(pool, add, elapsed) {
+  const pending = new Set();
+  const enough = () => pool.length >= POOL_TARGET || (pool.length >= 9 && elapsed() > SOFT_MS - 1500);
+  while (!enough() && elapsed() < 15000) {
+    if (pool.length + pending.size < POOL_TARGET + 2) {
+      const p = getFaceAI(enough).then(add, () => {}).then(() => pending.delete(p));
+      pending.add(p);
+    }
+    await sleep(AI_GAP);
+  }
+  while (pool.length < 9 && pending.size && elapsed() < HARD_MS) {
+    await Promise.race([...pending, sleep(250)]);
+  }
+}
 
 async function generate() {
   const t0 = performance.now();
-  const faces = [];
+  const elapsed = () => performance.now() - t0;
+  genSigs.length = 0;
+  const pool = [];
   const seen = new Set();
-  const timeLeft = () => performance.now() - t0 < 18500;
-  const push = (f) => {
-    if (!seen.has(f.key)) {
-      seen.add(f.key);
-      faces.push(f);
-      recent.push(f.key);
-      if (recent.length > 400) recent.shift();
-    }
+  const add = (f) => {
+    if (seen.has(f.key)) return;
+    seen.add(f.key);
+    pool.push(f);
+    recent.push(f.key);
+    if (recent.length > 400) recent.shift();
   };
+  if (mode === "ai") await collectAI(pool, add, elapsed);
+  else await collectReal(pool, add, elapsed);
+  if (pool.length < 9) throw new Error("could not collect 9 distinct faces");
 
-  while (faces.length < 9 && timeLeft()) {
-    const batch = await fetchBatch(9 - faces.length);
-    if (!batch.length) break;
-    batch.forEach(push);
-  }
-  if (faces.length < 9) throw new Error("could not collect 9 distinct faces");
-
-  const hg = geom(faces[0].tlm);
-  for (let i = 1; i < 9 && timeLeft(); i++) {
-    const layer = FEATURES[i - 1][0];
-    let cur = placeFeature(faces[i], hg, layer);
-    if ((cur.score ?? -1) >= MIN_FIT) continue;
-    let bestFace = faces[i];
-    let bestScore = cur.score ?? -1;
-    for (let t = 0; t < MAX_FIT_TRIES && timeLeft(); t++) {
-      const batch = await fetchBatch(1);
-      if (!batch.length) break;
-      const f = batch[0];
-      if (seen.has(f.key)) continue;
-      seen.add(f.key);
-      const p = placeFeature(f, hg, layer);
-      if ((p.score ?? -1) > bestScore) {
-        bestScore = p.score ?? -1;
-        bestFace = f;
-      }
-    }
-    faces[i] = bestFace;
-  }
-
-  const group = faces.slice(0, 9);
-  return { canvas: composite(group), group };
+  const plan = planCollage(pool);
+  const canvas = composite(plan);
+  const group = [plan.head, ...plan.picks.map((p) => p.face)];
+  window.__plan = {
+    pool: pool.length,
+    ms: Math.round(elapsed()),
+    head: { key: plan.head.key, yaw: +plan.head.g.yaw.toFixed(3) },
+    total: +plan.total.toFixed(2),
+    picks: plan.picks.map((p) => ({
+      layer: p.layer, key: p.face.key, flip: p.fit.flip,
+      scale: +p.fit.sRaw.toFixed(2), rot: +(p.fit.thRaw / RAD).toFixed(1),
+      cov: +p.fit.cov.toFixed(2), chk: +p.fit.chk.toFixed(2),
+      yaw: +p.face.g.yaw.toFixed(2), cost: +p.fit.cost.toFixed(2),
+    })),
+  };
+  return { canvas, group };
 }
+
+// ---------------------------------------------------------------- UI
 
 const btn = document.getElementById("gen");
 const imgEl = document.getElementById("out");
@@ -827,7 +1143,7 @@ const lightbox = document.getElementById("lightbox");
 const lightboxImg = document.getElementById("lightbox-img");
 const lightboxClose = document.getElementById("lightbox-close");
 const tabButtons = Array.from(document.querySelectorAll(".tab"));
-const SLOT_NAMES = ["head", ...FEATURES.map((f) => f[0])];
+const SLOT_NAMES = ["head", ...SLOTS];
 
 function renderThumbs(group) {
   thumbsEl.innerHTML = "";
