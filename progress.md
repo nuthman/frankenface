@@ -235,3 +235,5 @@ GitHub Pages cannot run Flask, so a fully client-side build was added in `docs/`
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python app.py        # serves http://127.0.0.1:8931
 ```
+Hosted static version (browser-only): https://nuthman.github.io/face-frankenstein/
+(source in `docs/`, served by GitHub Pages). Repo: nuthman/face-frankenstein.
