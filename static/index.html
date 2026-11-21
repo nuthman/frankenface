@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Face Frankenstein</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column;
+    background: #111318; color: #e8eaf0;
+    font-family: system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 18px 24px;
+    border-bottom: 1px solid #23262e;
+  }
+  h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  button {
+    font: inherit; font-weight: 700; font-size: 16px;
+    padding: 12px 26px; border-radius: 10px;
+    border: 0; cursor: pointer;
+    background: #3d6bff; color: #fff;
+  }
+  button:hover:not([disabled]) { background: #4f7bff; }
+  button:active:not([disabled]) { transform: translateY(1px); }
+  #stage {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    position: relative; min-height: 0; padding: 16px;
+  }
+  #out {
+    max-width: 100%; max-height: 100%;
+    object-fit: contain;
+    border-radius: 14px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5);
+    background: #20232a;
+  }
+  #status {
+    padding: 0 24px 16px; font-size: 13px; color: #8b93a5;
+    min-height: 20px;
+  }
+  .spinner {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 3px solid #3d6bff; border-top-color: transparent;
+    display: inline-block; vertical-align: -4px; margin-right: 8px;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  body.busy button { pointer-events: none; opacity: .45; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Face Frankenstein</h1>
+    <button id="gen">Generate</button>
+  </header>
+  <div id="stage"><img id="out" alt="Generated face"></div>
+  <div id="status"></div>
+  <script>
+    const btn = document.getElementById('gen');
+    const img = document.getElementById('out');
+    const status = document.getElementById('status');
+    let busy = false;
+    let currentURL = null;
+    btn.addEventListener('click', () => {
+      if (busy) return;
+      busy = true;
+      document.body.classList.add('busy');
+      btn.disabled = true;
+      status.innerHTML = '<span class="spinner"></span> Searching for 9 random people and cutting their features…';
+      fetch('/generate', { cache: 'no-store' }).then(r => {
+        if (!r.ok) throw new Error('server error ' + r.status);
+        return r.blob().then(b => [b, r.headers.get('X-Persons'), r.headers.get('X-Elapsed-Ms')]);
+      }).then(([blob, persons, ms]) => {
+        const url = URL.createObjectURL(blob);
+        img.src = url;
+        if (currentURL) URL.revokeObjectURL(currentURL);
+        currentURL = url;
+        busy = false;
+        document.body.classList.remove('busy');
+        btn.disabled = false;
+        const p = (persons || '').split(',');
+        status.textContent = 'New face from ' + p.length + ' different people (' +
+          p.map(x => '#' + x).join(' ') + ') in ' + (ms || '?') + ' ms. Click Generate again.';
+      }).catch(e => {
+        busy = false;
+        document.body.classList.remove('busy');
+        btn.disabled = false;
+        status.textContent = 'Generation failed: ' + e.message + ' — try again.';
+      });
+    });
+  </script>
+</body>
+</html>
