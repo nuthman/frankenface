@@ -25,7 +25,7 @@
   recovery click 2.4 s, hard cap 15 s (composite itself ~0.05 s).
 
 ## Decisions made
-- **App name**: FrankenFace (renamed from "Face Frankenstein"; the repo/URL stays `face-frankenstein`).
+- **App name**: FrankenFace (renamed from "Face Frankenstein"; the GitHub repo was renamed to `frankenface` as well).
 - **Image source**: `PhilSad/celeba-hq-15k` on Hugging Face via the public
   datasets-server `/rows` endpoint (random offset 0..14999 → 1024×1024 real
   front-facing portrait photos, no API key).
@@ -356,5 +356,5 @@ The local Flask app now serves the very same `docs/` build at http://127.0.0.1:8
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python app.py        # serves http://127.0.0.1:8931
 ```
-Hosted static version (browser-only): https://nuthman.github.io/face-frankenstein/
-(source in `docs/`, served by GitHub Pages). Repo: nuthman/face-frankenstein.
+Hosted static version (browser-only): https://nuthman.github.io/frankenface/
+(source in `docs/`, served by GitHub Pages). Repo: nuthman/frankenface.
