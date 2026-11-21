@@ -230,6 +230,16 @@ GitHub Pages cannot run Flask, so a fully client-side build was added in `docs/`
   first click generates a face from 9 distinct people in ~11 s, hard-cut collage
   output confirmed visually (`debug/web_out1` screenshots in earlier runs).
 
+### Update 6.1: clean scissor edges (fragmented edges fixed)
+The selfie segmenter mask is 256x256; nearest upscaling + thresholding produced
+staircase/fragmented edges (visible in a user zoom). Fix in `docs/main.js`:
+- smooth the category mask at native 256 res with two blur+threshold passes
+  (4 px then 2 px) before scaling up (bilinear, high quality) and warping;
+- a final `smoothMask` (blur 1.4 px + threshold) on every completed patch mask
+  removes 1-px specks/islands while keeping a hard edge.
+Verified headless: zoomed crop shows a clean continuous hairline cut with no
+fragmentation; full face still composites from 9 distinct people in ~11.5 s.
+
 ## How to run
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt

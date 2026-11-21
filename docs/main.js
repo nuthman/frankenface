@@ -140,6 +140,15 @@ function ellipsePath(x, cx, cy, rx, ry, A = null, n = 40) {
   x.fill();
 }
 
+function smoothMask(c) {
+  const t = newCanvas(c.width, c.height);
+  const x = t.getContext("2d", { willReadFrequently: true });
+  x.filter = "blur(1.4px)";
+  x.drawImage(c, 0, 0);
+  x.filter = "none";
+  return threshold(t);
+}
+
 function destIn(c, other) {
   const x = c.getContext("2d", { willReadFrequently: true });
   x.globalCompositeOperation = "destination-in";
@@ -262,6 +271,7 @@ function composite(faces) {
       m = destIn(m, clipCanvas(gd, A, layer, subtract));
     }
     m = destIn(m, warpAlpha(donor.alpha, A));
+    m = smoothMask(m);
     destIn(patch, m);
     ox.drawImage(patch, 0, 0);
   });
@@ -396,21 +406,36 @@ async function analyze(img, offset) {
   const ny = clamp(Math.round((lm[1][1] / h) * ch), 0, ch - 1);
   const person = cat[ny * cw + nx];
 
-  const maskSrc = newCanvas(w, h);
-  const msx = maskSrc.getContext("2d", { willReadFrequently: true });
-  const im = msx.createImageData(w, h);
+  const maskSmall = newCanvas(cw, ch);
+  const msx = maskSmall.getContext("2d", { willReadFrequently: true });
+  const im = msx.createImageData(cw, ch);
   const md = im.data;
-  for (let y = 0; y < h; y++) {
-    const sy = Math.min(ch - 1, Math.floor((y * ch) / h));
-    for (let x = 0; x < w; x++) {
-      const sx = Math.min(cw - 1, Math.floor((x * cw) / w));
-      const on = cat[sy * cw + sx] === person ? 255 : 0;
-      const i = (y * w + x) * 4;
-      md[i] = md[i + 1] = md[i + 2] = 255;
-      md[i + 3] = on;
-    }
+  for (let i = 0, p = 0; i < cat.length; i++, p += 4) {
+    const on = cat[i] === person ? 255 : 0;
+    md[p] = md[p + 1] = md[p + 2] = 255;
+    md[p + 3] = on;
   }
   msx.putImageData(im, 0, 0);
+
+  const maskClean = newCanvas(cw, ch);
+  const mcx = maskClean.getContext("2d", { willReadFrequently: true });
+  mcx.filter = "blur(4px)";
+  mcx.drawImage(maskSmall, 0, 0);
+  mcx.filter = "none";
+  threshold(maskClean);
+  const maskClean2 = newCanvas(cw, ch);
+  const mc2 = maskClean2.getContext("2d", { willReadFrequently: true });
+  mc2.filter = "blur(2px)";
+  mc2.drawImage(maskClean, 0, 0);
+  mc2.filter = "none";
+  threshold(maskClean2);
+
+  const maskSrc = newCanvas(w, h);
+  const ms2 = maskSrc.getContext("2d", { willReadFrequently: true });
+  ms2.imageSmoothingEnabled = true;
+  ms2.imageSmoothingQuality = "high";
+  ms2.drawImage(maskClean2, 0, 0, w, h);
+  threshold(maskSrc);
 
   const alpha = newCanvas();
   const ax = alpha.getContext("2d", { willReadFrequently: true });
@@ -419,6 +444,7 @@ async function analyze(img, offset) {
   ax.drawImage(maskSrc, 0, 0);
   ax.setTransform(1, 0, 0, 1, 0, 0);
   threshold(alpha);
+  smoothMask(alpha);
 
   return {
     offset,
